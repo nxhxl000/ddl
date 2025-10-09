@@ -1,0 +1,9 @@
+﻿__pycache__/
+*.py[cod]
+.venv/
+.vscode/
+data/
+outputs/
+logs/
+checkpoints/
+wandb/
