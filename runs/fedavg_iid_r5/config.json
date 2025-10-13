@@ -1,0 +1,11 @@
+{
+  "split_path": "splits/cifar10_iid_K20_seed42.json",
+  "rounds": 5,
+  "clients_per_round": 5,
+  "local_epochs": 1,
+  "batch_size": 64,
+  "lr": 0.01,
+  "seed": 42,
+  "run_dir": "runs/fedavg_iid_r5",
+  "data_dir": "data"
+}
