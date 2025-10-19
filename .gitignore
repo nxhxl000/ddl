@@ -13,12 +13,16 @@ __pycache__/
 
 # data & artifacts
 data/
+experements/
 splits/*.json
 reports/
 runs/
+outputs/
+runconfig/
 checkpoints/
 *.pt
 *.ckpt
+*.pth
 
 # notebooks
 .ipynb_checkpoints/

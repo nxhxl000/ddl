@@ -7,22 +7,28 @@ from typing import List
 
 import numpy as np
 import matplotlib.pyplot as plt
+from torchvision import datasets
 
 
-def load_stats(path: Path) -> dict:
+def load_split(path: Path) -> dict:
+    """Загружаем json файл сплита и извлекаем необходимые данные."""
     data = json.loads(path.read_text(encoding="utf-8"))
-    # поддержка обоих форматов: отдельный *_stats.json или meta внутри split.json
-    if "class_hist_per_client" in data:
+    if "indices" in data and "classes" in data:
         return data
-    if "meta" in data and isinstance(data["meta"], dict):
-        meta = data["meta"]
-        required = ["class_hist_per_client", "class_hist_overall"]
-        if all(k in meta for k in required):
-            return meta
-    raise ValueError(
-        f"Не найден блок статистики в {path} "
-        "(ожидались ключи 'class_hist_per_client'/'class_hist_overall' либо meta с этими полями)."
-    )
+    raise ValueError(f"Не найдено необходимых данных в {path}")
+
+
+def generate_histograms(split, labels, num_classes=10):
+    """Генерация гистограмм классов для каждого клиента и общей гистограммы"""
+    class_hist_per_client = []
+    for client_indices in split:
+        hist = [0] * num_classes
+        for idx in client_indices:
+            label = labels[idx]  # Используем реальную метку из датасета
+            hist[label] += 1
+        class_hist_per_client.append(hist)
+    
+    return class_hist_per_client
 
 
 def ensure_out(out_dir: Path) -> Path:
@@ -30,42 +36,19 @@ def ensure_out(out_dir: Path) -> Path:
     return out_dir
 
 
-def plot_overall_hist(overall: List[int], class_names: List[str], out: Path, dpi: int = 140):
-    x = np.arange(len(overall))
-    fig = plt.figure(figsize=(10, 4))
-    plt.bar(x, overall)
-    plt.xticks(x, class_names, rotation=40, ha="right")
-    plt.ylabel("Samples")
-    plt.title("Overall class histogram")
-    plt.tight_layout()
-    fig.savefig(out / "overall_class_hist.png", dpi=dpi)
-    plt.close(fig)
+def plot_clients_size_hist(hist: np.ndarray, out: Path, dpi: int = 140):
+    """Гистограмма для количества данных у каждого клиента"""
+    sizes = hist.sum(axis=1)
 
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar(np.arange(len(sizes)), sizes)
+    ax.set_xlabel("Client id")
+    ax.set_ylabel("Samples per client")
+    ax.set_title("Samples per Client")
+    ax.set_ylim(0, max(sizes) + 500)
 
-def plot_clients_size_hist(hists: np.ndarray, out: Path, dpi: int = 140):
-    sizes = hists.sum(axis=1)
-    fig = plt.figure(figsize=(10, 4))
-    plt.bar(np.arange(len(sizes)), sizes)
-    plt.xlabel("Client id")
-    plt.ylabel("Samples per client")
-    plt.title("Client sizes")
     plt.tight_layout()
     fig.savefig(out / "clients_sizes.png", dpi=dpi)
-    plt.close(fig)
-
-
-def plot_dominant_fraction(hists: np.ndarray, out: Path, dpi: int = 140):
-    sizes = hists.sum(axis=1).clip(min=1)
-    dom = (hists.max(axis=1) / sizes)
-    order = np.argsort(dom)
-    fig = plt.figure(figsize=(10, 4))
-    plt.bar(np.arange(len(dom)), dom[order])
-    plt.xlabel("Client (sorted by dominance)")
-    plt.ylabel("Dominant class fraction")
-    plt.ylim(0, 1.0)
-    plt.title("Dominant class fraction per client")
-    plt.tight_layout()
-    fig.savefig(out / "dominant_fraction_per_client.png", dpi=dpi)
     plt.close(fig)
 
 
@@ -113,8 +96,8 @@ def plot_stacked_firstN(hists: np.ndarray, class_names: List[str], out: Path, to
 
 def main():
     ap = argparse.ArgumentParser(description="Визуализация метаданных сплитов CIFAR-10 (IID/Dirichlet).")
-    ap.add_argument("--stats", type=str, required=True,
-                    help="Путь к *_stats.json или к split.json (если в meta есть статистика).")
+    ap.add_argument("--split", type=str, required=True,
+                    help="Путь к split.json.")
     ap.add_argument("--out", type=str, default="reports/splits",
                     help="Каталог для сохранения графиков.")
     ap.add_argument("--top_n", type=int, default=10,
@@ -122,39 +105,36 @@ def main():
     ap.add_argument("--dpi", type=int, default=140)
     args = ap.parse_args()
 
-    stats_path = Path(args.stats)
+    split_path = Path(args.split)
     out_dir = ensure_out(Path(args.out))
 
-    stats = load_stats(stats_path)
+    # Создание папки для конкретного сплита
+    split_name = split_path.stem  # Название сплита (например, "cifar10_iid_K20_seed42")
+    split_out_dir = out_dir / split_name
+    split_out_dir.mkdir(parents=True, exist_ok=True)
+
+    split_data = load_split(split_path)
+
+    # Путь к данным (аналогично make_splits.py)
+    data_dir = Path(__file__).resolve().parents[1] / "data"
+    trainset = datasets.CIFAR10(str(data_dir), train=True, download=False, transform=None)
+    labels = np.asarray(trainset.targets, dtype=int)  # Реальные метки
 
     # Классы
-    if "classes" in stats and isinstance(stats["classes"], list):
-        class_names = stats["classes"]
-    else:
-        # CIFAR-10 по умолчанию
-        class_names = ["airplane", "automobile", "bird", "cat", "deer",
-                       "dog", "frog", "horse", "ship", "truck"]
+    class_names = split_data.get("classes", ["airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "horse", "ship", "truck"])
 
-    # Гистограммы
-    per_client = np.asarray(stats["class_hist_per_client"], dtype=int)  # [K, C]
-    overall = np.asarray(stats["class_hist_overall"], dtype=int)        # [C]
+    # Разделение на индексы
+    client_indices = split_data["indices"]
+
+    # Генерация гистограмм
+    hist_per_client = generate_histograms(client_indices, labels)
 
     # Графики
-    plot_overall_hist(overall.tolist(), class_names, out_dir, dpi=args.dpi)
-    plot_clients_size_hist(per_client, out_dir, dpi=args.dpi)
-    plot_dominant_fraction(per_client, out_dir, dpi=args.dpi)
-    plot_heatmap_fractions(per_client, class_names, out_dir, dpi=args.dpi)
-    plot_stacked_firstN(per_client, class_names, out_dir, top_n=args.top_n, dpi=args.dpi)
+    plot_clients_size_hist(np.array(hist_per_client), split_out_dir, dpi=args.dpi)
+    plot_heatmap_fractions(np.array(hist_per_client), class_names, split_out_dir, dpi=args.dpi)
+    plot_stacked_firstN(np.array(hist_per_client), class_names, split_out_dir, top_n=args.top_n, dpi=args.dpi)
 
-    # Консольный summary
-    sizes = per_client.sum(axis=1)
-    dom = per_client.max(axis=1) / np.clip(sizes, 1, None)
-    print("\nSummary:")
-    print(f"- clients: {per_client.shape[0]} | classes: {per_client.shape[1]}")
-    print(f"- samples per client: min={sizes.min()}  p50={np.median(sizes)}  max={sizes.max()}")
-    print(f"- dominant frac per client: min={dom.min():.3f}  p50={np.median(dom):.3f}  max={dom.max():.3f}")
-    print(f"[✓] Saved plots to: {out_dir.resolve()}")
-
+    print(f"[✓] Saved plots to: {split_out_dir.resolve()}")
 
 if __name__ == "__main__":
     main()
