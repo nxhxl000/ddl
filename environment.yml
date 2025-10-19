@@ -1,18 +1,8 @@
-name: ddl
+name: ddl_wsl2
 channels:
   - conda-forge
 dependencies:
   - python=3.12
   - pip
-  # базовые научные пакеты через conda (стабильные бинарники под Windows)
-  - numpy
-  - pandas
-  - scikit-learn
-  - matplotlib
-  - pyyaml
-  - pillow==11.2.1
-  # pip-пакеты + подключение файла с pinned Torch cu128
   - pip:
-      - flwr
-      - torchmetrics==1.7.1
-      - -r requirements-cu128.txt   # ← ВАЖНО: дернёт pip с index-url и пинами
+      - -r requirements.txt

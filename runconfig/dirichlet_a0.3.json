@@ -1,1 +1,0 @@
-﻿{ "split_path":"splits/cifar10_dirichlet_a0.3_K20_seed42.json","rounds":20,"clients_per_round":5,"local_epochs":2,"batch_size":64,"lr":0.01,"data_dir":"data" }
