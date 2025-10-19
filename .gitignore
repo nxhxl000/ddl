@@ -1,9 +1,34 @@
-﻿__pycache__/
-*.py[cod]
+﻿# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# env/IDE
 .venv/
+.env
 .vscode/
+.idea/
+
+# data & artifacts
 data/
+experements/
+splits/*.json
+reports/
+runs/
 outputs/
-logs/
+runconfig/
 checkpoints/
-wandb/
+*.pt
+*.ckpt
+*.pth
+
+# notebooks
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+# installers
+miniconda.sh
