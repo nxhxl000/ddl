@@ -1,0 +1,20 @@
+{
+  "best_val_acc": 0.8325544554455445,
+  "epochs": 20,
+  "csv_log": "runs/20251125_235622_erasing_bs64_ls0.15_wd1e-4/log.csv",
+  "best_ckpt": "runs/20251125_235622_erasing_bs64_ls0.15_wd1e-4/best.ckpt",
+  "last_ckpt": "runs/20251125_235622_erasing_bs64_ls0.15_wd1e-4/last.ckpt",
+  "device": "cuda",
+  "classes": [
+    "apple_pie",
+    "baby_back_ribs",
+    "baklava",
+    "beef_carpaccio",
+    "beef_tartare",
+    "beet_salad",
+    "beignets",
+    "bibimbap",
+    "bread_pudding",
+    "breakfast_burrito"
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "best_val_acc": 0.7907326732673268,
+  "epochs": 20,
+  "csv_log": "runs/20251111_155526_base/log.csv",
+  "best_ckpt": "runs/20251111_155526_base/best.ckpt",
+  "last_ckpt": "runs/20251111_155526_base/last.ckpt",
+  "classes": [
+    "apple_pie",
+    "baby_back_ribs",
+    "baklava",
+    "beef_carpaccio",
+    "beef_tartare",
+    "beet_salad",
+    "beignets",
+    "bibimbap",
+    "bread_pudding",
+    "breakfast_burrito"
+  ]
+}

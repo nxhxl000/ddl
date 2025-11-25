@@ -16,7 +16,6 @@ data/
 experements/
 splits/*.json
 reports/
-runs/
 outputs/
 runconfig/
 checkpoints/
