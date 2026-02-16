@@ -27,7 +27,8 @@ pip install -r requirements.txt
 Команда установки стабильных версий библиотек для CUDA 12.8:
 
 ```bash
-pip install --pre --index-url https://download.pytorch.org/whl/nightly/cu128 torch==2.10.0.dev20251013+cu128 torchvision==0.25.0.dev20251013+cu128 torchaudio==2.8.0.dev20251013+cu128
+python -m pip uninstall -y torch torchvision torchaudio
+python -m pip install --pre --index-url https://download.pytorch.org/whl/nightly/cu128 torch torchvision torchaudio
 ```
 
 Для активации виртуального окружения:
