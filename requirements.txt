@@ -1,2 +1,38 @@
--r requirements-core.txt
--r requirements-gpu-nightly-cu128.txt
+# =========================
+# Federated Learning (Flower)
+# =========================
+flwr[simulation]==1.22.0
+flwr-datasets[vision]>=0.5.0
+
+# =========================
+# ML framework
+# =========================
+torch
+torchvision
+torchaudio
+
+# =========================
+# Metrics / utils
+# =========================
+torchmetrics==1.7.1
+numpy
+pandas
+scikit-learn
+matplotlib
+pyyaml
+pillow==11.2.1
+tqdm
+rich
+
+# =========================
+# Dev
+# =========================
+pytest
+ruff
+
+# -------------------------
+# GPU (CUDA 12.8 nightly) — Если хотите использовать CUDA узлы
+# Ставить отдельной командой на Linux/WSL + NVIDIA:
+# pip install --pre --index-url https://download.pytorch.org/whl/nightly/cu128 \
+#   torch==2.10.0.dev20251013+cu128 torchvision==0.25.0.dev20251013+cu128 torchaudio==2.8.0.dev20251013+cu128
+# -------------------------
