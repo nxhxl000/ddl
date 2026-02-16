@@ -1,34 +1,60 @@
-﻿# python
+﻿# =========================
+# Python
+# =========================
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.pyd
+*.so
 *.egg-info/
+build/
+dist/
 
-# env/IDE
+# =========================
+# Virtual environments
+# =========================
 .venv/
-.env
+venv/
+env/
+
+# =========================
+# IDE
+# =========================
 .vscode/
 .idea/
+*.iml
 
-# data & artifacts
+# =========================
+# Test/Lint caches
+# =========================
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# =========================
+# Data & experiment artifacts
+# =========================
 data/
-experements/
-splits/*.json
-reports/
 runs/
 outputs/
-runconfig/
-checkpoints/
+results/
+logs/
+
+# Model checkpoints
 *.pt
-*.ckpt
 *.pth
+*.ckpt
+*.onnx
 
-# notebooks
-.ipynb_checkpoints/
+# =========================
+# Secrets
+# =========================
+.env
+.env.*
 
+# =========================
 # OS
+# =========================
 .DS_Store
 Thumbs.db
-# installers
-miniconda.sh
