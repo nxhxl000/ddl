@@ -1,5 +1,5 @@
 # =====================================================================
-# For a full TOML configuration guide, check the Flower docs:
+# Flower app configuration
 # https://flower.ai/docs/framework/how-to-configure-pyproject-toml.html
 # =====================================================================
 
@@ -10,7 +10,7 @@ build-backend = "hatchling.build"
 [project]
 name = "ddl-flower-app"
 version = "1.0.0"
-description = "Federated Learning app for CIFAR-10 with custom splits"
+description = "Federated Learning app"
 license = "Apache-2.0"
 
 dependencies = [
@@ -22,28 +22,50 @@ dependencies = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
- 
+
 [tool.flwr.app]
 publisher = "nxhxl"
 
 [tool.flwr.app.components]
-serverapp = "fl_app.server_app:app"  
+serverapp = "fl_app.server_app:app"
 clientapp = "fl_app.client_app:app"
 
+# -----------------------------------------------------
+# Run config (передаётся в context.run_config)
+# -----------------------------------------------------
 [tool.flwr.app.config]
-data_dir = "data/"
-batch_size = 64
-local_epochs = 5
-lr = 0.001
-rounds = 20
-split_path = "splits/cifar10_dirichlet_a0.07_K10_seed42.json"
-fraction_train = 0.5
+# Data
+dataset = "mnist"
+data-dir = "data/"
+
+# Partitioning
+scheme = "dirichlet"              # "iid" | "dirichlet"
+alpha = 0.3                 # используется только при scheme="dirichlet"
+seed = 42
+min-partition-size = 0
+
+# Training
+batch-size = 64
+local-epochs = 5
+learning-rate = 0.001
+
+# Federated selection
+fraction-train = 1.0
+fraction-evaluate = 0.0     # <-- важно: клиенты НЕ валидируют (валидация на сервере через evaluate_fn)
+
+# Dataloader
+num-workers = 0
+
+#logs
+num-clients = 10
+partition-plot-type = "heatmap"   # или "bar"
+partition-size-unit = "percent"   # или "absolute"
 
 [tool.flwr.federations]
 default = "local-simulation"
 
 [tool.flwr.federations.local-simulation]
 options.num-supernodes = 10
-options.num-rounds = 20
+options.num-rounds = 10  
 options.backend.client-resources.num-cpus = 2
-options.backend.client-resources.num-gpus = 1.0
+options.backend.client-resources.num-gpus = 1.0  # если нет GPU — поставь 0.0
