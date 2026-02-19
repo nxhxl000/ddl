@@ -52,8 +52,26 @@ python -m scripts.download_datasets
 python -m scripts.split_check
 python -m scripts.cuda_check
 ```
+## 5) Загрузка моделей для эксперементов
 
-## 5) Скрипты для федеративного обучения
+Скрипт находится по пути: scripts/load_models.py 
+Загружает и подготавливает модели для дальнейших экспериментов
+Параметр "--pretrained" позволяет загрузить предобученные модели для ResNet/MobileNet 
+Модели сохраняются в папки: models/cifar10; models/mnist
+```bash
+python -m scripts.load_models
+python -m scripts.load_models --pretrained 
+```
+## 6) Проведение локальных эксперементов
+
+Скрипт находится по пути scripts/local_train.py
+Локальные эксперименты сохраняются в отдельную папку local_exp/
+Запуск:
+ ```bash
+python -m scripts.local_train
+```
+
+## 7) Скрипты для федеративного обучения
 
 Основыне скрипты, отвечающие за федеративное обучение находятся в папке fl_app/
 
