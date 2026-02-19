@@ -41,6 +41,7 @@ outputs/
 results/
 logs/
 reports/
+models/
 
 # Model checkpoints
 *.pt

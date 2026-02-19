@@ -35,26 +35,34 @@ clientapp = "fl_app.client_app:app"
 # -----------------------------------------------------
 [tool.flwr.app.config]
 # Data
-dataset = "mnist"
+dataset = "cifar10"       # cifar10 | mnist
 data-dir = "data/"
 
 # Partitioning
-scheme = "dirichlet"              # "iid" | "dirichlet"
+scheme = "iid"              # "iid" | "dirichlet"
 alpha = 0.3                 # используется только при scheme="dirichlet"
 seed = 42
 min-partition-size = 0
-
-# Training
-batch-size = 64
-local-epochs = 5
-learning-rate = 0.001
 
 # Federated selection
 fraction-train = 1.0
 fraction-evaluate = 0.0     # <-- важно: клиенты НЕ валидируют (валидация на сервере через evaluate_fn)
 
-# Dataloader
-num-workers = 0
+# Aggregation strategy
+aggregation = "fedadam"          # варианты: fedavg; fedavgm; fedadam; fedyogi; fedadagrad; fedmedian; fedtrimmedavg; krum; multikrum; bulyan
+# --- опционально, параметры под стратегии ---
+server-learning-rate = 1.0      # для fedavgm
+server-momentum = 0.9           # для fedavgm
+
+server-eta = 0.01               # для fedadam/fedyogi/fedadagrad (server lr)
+server-eta-l = 0.001            # "client lr" параметр FedOpt (обычно = реальному lr клиента)
+server-beta1 = 0.9              # fedadam/fedyogi
+server-beta2 = 0.99             # fedadam/fedyogi
+server-tau = 1e-9               # fedadam/fedyogi/fedadagrad
+
+trimmed-beta = 0.2              # fedtrimmedavg
+num-malicious-nodes = 0         # krum/multikrum/bulyan
+num-nodes-to-select = 1         # multikrum
 
 #logs
 num-clients = 10

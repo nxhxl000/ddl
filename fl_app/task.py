@@ -18,6 +18,39 @@ SplitScheme = Literal["iid", "dirichlet"]
 Transform = Callable[[Any], Any]
 
 
+# ============================================================
+# Default hyperparameters (moved from pyproject.toml -> task.py)
+# ============================================================
+
+@dataclass(frozen=True)
+class TrainHParams:
+    """Дефолтные гиперпараметры обучения (используются, если их нет в run_config)."""
+    batch_size: int = 64
+    local_epochs: int = 5
+    lr: float = 0.001
+    momentum: float = 0.9
+    weight_decay: float = 0.0
+    num_workers: int = 0
+
+
+def default_hparams(dataset: str) -> TrainHParams:
+    """
+    Вернуть дефолтные гиперпараметры для датасета.
+    Сейчас оставлены значения как в твоём pyproject.toml (batch=64, epochs=5, lr=0.001).
+    При желании можно сделать dataset-specific (MNIST/CIFAR) — просто раскомментируй/измени.
+    """
+    _ = dataset.lower()
+    # пример (если захочешь разные дефолты):
+    # if _.startswith("mnist"):
+    #     return TrainHParams(batch_size=64, local_epochs=5, lr=0.01)
+    # if _.startswith("cifar"):
+    #     return TrainHParams(batch_size=64, local_epochs=5, lr=0.05)
+    return TrainHParams()
+
+
+# ============================================================
+
+
 @dataclass(frozen=True)
 class FederatedData:
     dataset_name: str
@@ -52,6 +85,7 @@ def _infer_image_name(ds: Dataset) -> str:
         if k in keys:
             return k
     raise KeyError(f"Не нашёл колонку с изображением. Доступные: {sorted(keys)}")
+
 
 def get_device(prefer_cuda: bool = True) -> torch.device:
     """Единая функция выбора девайса."""
@@ -243,6 +277,7 @@ def make_server_testloader(
     meta = {"img_col": img_col, "label_col": label_col}
     return test_loader, meta
 
+
 def create_model(dataset: str) -> nn.Module:
     """
     Одна и та же модель для MNIST и CIFAR-10.
@@ -271,6 +306,7 @@ def create_model(dataset: str) -> nn.Module:
             return self.fc(x)
 
     return Net()
+
 
 def train_one_client(
     model: nn.Module,

@@ -16,6 +16,7 @@ try:
         get_device,
         prepare_federated_dataset,
         make_client_trainloader,
+        default_hparams,  # <-- NEW
     )
 except Exception:  # pragma: no cover
     from task import (  # type: ignore
@@ -23,6 +24,7 @@ except Exception:  # pragma: no cover
         get_device,
         prepare_federated_dataset,
         make_client_trainloader,
+        default_hparams,  # <-- NEW
     )
 
 
@@ -77,16 +79,22 @@ def train(msg: Message, context: Context) -> Message:
     seed: int = int(_rc(context, "seed", default=42))
     data_dir: str = _rc(context, "data-dir", "data_dir", default="data/")
 
-    batch_size: int = int(_rc(context, "batch-size", "batch_size", default=64))
-    local_epochs: int = int(_rc(context, "local-epochs", "local_epochs", default=1))
-    min_partition_size: int = int(_rc(context, "min-partition-size", "min_partition_size", default=0))
-    num_workers: int = int(_rc(context, "num-workers", "num_workers", default=0))
+    # ---- defaults from task.py ----
+    hp = default_hparams(dataset_name)
 
-    momentum: float = float(_rc(context, "momentum", default=0.9))
-    weight_decay: float = float(_rc(context, "weight_decay", default=0.0))
+    batch_size: int = int(_rc(context, "batch-size", "batch_size", default=hp.batch_size))
+    local_epochs: int = int(_rc(context, "local-epochs", "local_epochs", default=hp.local_epochs))
+    num_workers: int = int(_rc(context, "num-workers", "num_workers", default=hp.num_workers))
+
+    momentum: float = float(_rc(context, "momentum", default=hp.momentum))
+    weight_decay: float = float(_rc(context, "weight_decay", default=hp.weight_decay))
+
+    min_partition_size: int = int(
+        _rc(context, "min-partition-size", "min_partition_size", default=0)
+    )
 
     # lr может приходить от сервера (train_config)
-    lr_default: float = float(_rc(context, "learning-rate", "lr", default=0.001))
+    lr_default: float = float(_rc(context, "learning-rate", "lr", default=hp.lr))
     try:
         lr: float = float(msg.content["config"]["learning-rate"])
     except Exception:
@@ -140,7 +148,7 @@ def train(msg: Message, context: Context) -> Message:
     t0 = time.perf_counter()
     model.train()
 
-    for ep in range(local_epochs):
+    for _ep in range(local_epochs):
         loss_sum = 0.0
         batches = 0
 
@@ -176,7 +184,7 @@ def train(msg: Message, context: Context) -> Message:
         }
     )
 
-    # Детализация для логов (НЕ агрегируемая стратегией по умолчанию)
+    # Детализация для логов
     details = ConfigRecord(
         {
             "partition-id": partition_id,
