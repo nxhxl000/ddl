@@ -198,24 +198,19 @@ def train(msg: Message, context: Context) -> Message:
     # ---- reply ----
     arrays = ArrayRecord(model.state_dict())
 
-    # Для стандартной агрегации FedAvg оставляем простые метрики
+    # Все метаданные кладём в MetricRecord — ConfigRecord не всегда
+    # пробрасывается через distributed pipeline (SuperNode → SuperLink → ServerApp)
     metrics = MetricRecord(
         {
             "train_loss": avg_train_loss,
-            "num-examples": num_examples,  # ключ для взвешивания (как у тебя в логах)
-        }
-    )
-
-    # Детализация для логов
-    details = ConfigRecord(
-        {
-            "partition-id": partition_id,
-            "local-epochs": local_epochs,
-            "epoch-train-losses": [float(x) for x in epoch_losses],
+            "num-examples": float(num_examples),
+            "partition-id": float(partition_id),
+            "local-epochs": float(local_epochs),
             "round-time-sec": float(round_time_sec),
-            "num-examples": num_examples,
+            "first-epoch-loss": float(epoch_losses[0]) if epoch_losses else 0.0,
+            "last-epoch-loss": float(epoch_losses[-1]) if epoch_losses else 0.0,
         }
     )
 
-    content = RecordDict({"arrays": arrays, "metrics": metrics, "details": details})
+    content = RecordDict({"arrays": arrays, "metrics": metrics})
     return Message(content=content, reply_to=msg)
