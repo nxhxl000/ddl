@@ -67,7 +67,7 @@ for ip in "${CLIENT_IPS[@]}"; do
     tmux new-session -d -s $SESSION
     tmux send-keys -t $SESSION \
       'cd $REMOTE_DIR && source .venv/bin/activate && \
-       flwr supernode \
+       flower-supernode \
          --superlink $SERVER_INT:9092 \
          --insecure \
          --node-config \"partition-id=$PARTITION,num-partitions=$NUM_PARTITIONS\"' \

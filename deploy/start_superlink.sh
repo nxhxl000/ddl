@@ -16,7 +16,7 @@ tmux kill-session -t "$SESSION" 2>/dev/null || true
 
 tmux new-session -d -s "$SESSION"
 tmux send-keys -t "$SESSION" \
-  "cd $REPO_DIR && source .venv/bin/activate && flwr superlink --insecure" Enter
+  "cd $REPO_DIR && source .venv/bin/activate && flower-superlink --insecure" Enter
 
 echo "SuperLink started in tmux session '$SESSION'"
 echo "Attach: tmux attach -t $SESSION"
