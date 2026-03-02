@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import csv
+import json
 import platform
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple, Type
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Type
 
 import flwr
 import torch
@@ -24,6 +27,7 @@ from flwr.serverapp.strategy import (
     Krum,
     MultiKrum,
     Bulyan,
+    FedProx,
 )
 
 # Поддержим оба варианта: task.py в корне или fl_app/task.py
@@ -158,7 +162,6 @@ def _write_header(
         f.write(f"data_dir: {data_dir}\n")
         f.write(f"num_rounds: {num_rounds}\n")
 
-        # гиперпараметры обучения (у клиентов)
         f.write(f"batch_size: {batch_size}\n")
         f.write(f"local_epochs: {local_epochs}\n")
         f.write(f"learning_rate: {lr}\n")
@@ -217,10 +220,12 @@ def _make_logging_strategy_cls(base_cls: Type[Any]) -> Type[Any]:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
             self.round_client_logs: Dict[int, Dict[int, Dict[str, Any]]] = {}
+            self._round_start_times: Dict[int, float] = {}
 
         def aggregate_train(
             self, server_round: int, replies: Iterable[Message]
         ) -> Tuple[Optional[ArrayRecord], Optional[MetricRecord]]:
+            self._round_start_times[server_round] = time.time()
             replies_list = list(replies)
 
             per_round: Dict[int, Dict[str, Any]] = {}
@@ -251,13 +256,12 @@ def _make_logging_strategy_cls(base_cls: Type[Any]) -> Type[Any]:
 def _pick_strategy(context: Context, fraction_train: float) -> Tuple[Any, str, Dict[str, Any]]:
     agg = str(_rc(context, "aggregation", "agg", default="fedavg")).strip().lower()
 
-    # Общие параметры (важно для robust-стратегий: чаще нужен минимум 2 клиента)
     min_train_nodes = int(_rc(context, "min-train-nodes", "min_train_nodes", default=1))
     min_available_nodes = int(_rc(context, "min-available-nodes", "min_available_nodes", default=1))
 
     common = dict(
         fraction_train=float(fraction_train),
-        fraction_evaluate=0.0,  # client-side eval disabled
+        fraction_evaluate=0.0,
         min_train_nodes=min_train_nodes,
         min_evaluate_nodes=0,
         min_available_nodes=min_available_nodes,
@@ -270,6 +274,12 @@ def _pick_strategy(context: Context, fraction_train: float) -> Tuple[Any, str, D
 
     if agg in {"fedavg", "avg"}:
         base_cls = FedAvg
+
+    elif agg in {"fedprox", "prox"}:
+        base_cls = FedProx
+        params = {
+            "proximal_mu": float(_rc(context, "mu", "proximal-mu", "proximal_mu", default=0.01)),
+        }
 
     elif agg in {"fedavgm", "avgm"}:
         base_cls = FedAvgM
@@ -341,13 +351,33 @@ def _pick_strategy(context: Context, fraction_train: float) -> Tuple[Any, str, D
     else:
         raise ValueError(
             f"Unknown aggregation='{agg}'. "
-            "Use one of: fedavg, fedavgm, fedadam, fedyogi, fedadagrad, "
+            "Use one of: fedavg, fedprox, fedavgm, fedadam, fedyogi, fedadagrad, "
             "fedmedian, fedtrimmedavg, krum, multikrum, bulyan."
         )
 
     LoggingCls = _make_logging_strategy_cls(base_cls)
     strategy = LoggingCls(**common, **params)
     return strategy, agg, params
+
+
+def _init_rounds_csv(path: Path) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "round", "test_acc", "test_loss", "n_clients",
+            "comm_down_mb", "comm_up_mb", "cum_comm_mb",
+            "round_wall_time_sec", "max_client_time_sec", "mean_client_time_sec",
+            "mean_train_loss", "std_train_loss",
+        ])
+
+
+def _init_clients_csv(path: Path) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "round", "client_id", "num_examples", "local_epochs",
+            "train_loss", "round_time_sec",
+        ])
 
 
 app = ServerApp()
@@ -367,7 +397,6 @@ def main(grid: Grid, context: Context) -> None:
     num_rounds: int = int(_rc(context, "num-server-rounds", "num_rounds", "num-rounds", default=10))
     fraction_train: float = float(_rc(context, "fraction-train", "fraction_train", default=1.0))
 
-    # число клиентов (для разбиения/визуализации/логов)
     num_clients_for_partition = int(_rc(context, "num-clients", "num_clients", default=10))
 
     # --- defaults (task.py) ---
@@ -382,7 +411,7 @@ def main(grid: Grid, context: Context) -> None:
     # --- choose aggregation strategy ---
     strategy, agg_name, agg_params = _pick_strategy(context, fraction_train=fraction_train)
 
-    # --- experiment folder name: dataset + scheme (+alpha if dirichlet) + aggregation ---
+    # --- experiment folder ---
     ds_tag = _safe_tag(dataset_name)
     sc_tag = _safe_tag(scheme)
     ag_tag = _safe_tag(agg_name)
@@ -392,10 +421,8 @@ def main(grid: Grid, context: Context) -> None:
         exp_name += f"__a{_alpha_tag(alpha)}"
     exp_name += f"__{ag_tag}"
 
-    # (файлы внутри делаем уникальнее за счёт num-clients)
     run_base = f"{exp_name}__n{int(num_clients_for_partition)}"
 
-    # куда складывать эксперименты
     runs_dir = Path(_rc(context, "runs-dir", "runs_dir", default="runs"))
     experiment_dir = runs_dir / exp_name
     experiment_dir.mkdir(parents=True, exist_ok=True)
@@ -403,10 +430,20 @@ def main(grid: Grid, context: Context) -> None:
     log_path = experiment_dir / f"{run_base}.log"
     partition_plot_path = experiment_dir / f"{run_base}__partition.png"
     final_model_path = experiment_dir / f"{run_base}.pt"
+    rounds_csv_path = experiment_dir / f"{run_base}__rounds.csv"
+    clients_csv_path = experiment_dir / f"{run_base}__clients.csv"
+    summary_json_path = experiment_dir / f"{run_base}__summary.json"
 
     # ---- model ----
     global_model = create_model(dataset_name)
     initial_arrays = ArrayRecord(global_model.state_dict())
+
+    # Compute model size in bytes once
+    model_bytes = sum(
+        int(t.numel() * t.element_size())
+        for t in global_model.state_dict().values()
+        if hasattr(t, "numel") and hasattr(t, "element_size")
+    )
 
     # ---- partition visualization + server test loader ----
     fed = prepare_federated_dataset(
@@ -432,7 +469,7 @@ def main(grid: Grid, context: Context) -> None:
     )
     device = get_device(prefer_cuda=True)
 
-    # ---- write header FIRST ----
+    # ---- write log header ----
     run_config_snapshot = _run_config_to_dict(context)
     _write_header(
         log_path,
@@ -460,6 +497,15 @@ def main(grid: Grid, context: Context) -> None:
         experiment_dir=experiment_dir,
     )
 
+    # ---- init CSV files ----
+    _init_rounds_csv(rounds_csv_path)
+    _init_clients_csv(clients_csv_path)
+
+    # ---- mutable state for closures ----
+    run_start_time = time.time()
+    cum_comm_mb = 0.0
+    all_round_accs: List[Tuple[int, float]] = []  # (round, test_acc)
+
     def append_round_log(server_round: int, server_metrics: MetricRecord) -> None:
         client_logs = strategy.get_round_logs(server_round)  # type: ignore[attr-defined]
 
@@ -481,6 +527,8 @@ def main(grid: Grid, context: Context) -> None:
             f.write(f"    Server_eval: test_acc: {test_acc:.4f} | test_loss: {test_loss:.6f}\n\n")
 
     def global_evaluate(server_round: int, arrays: ArrayRecord) -> MetricRecord:
+        nonlocal cum_comm_mb
+
         model = create_model(dataset_name)
         model.load_state_dict(arrays.to_torch_state_dict())
 
@@ -502,6 +550,92 @@ def main(grid: Grid, context: Context) -> None:
         )
 
         append_round_log(server_round, metrics)
+
+        # ---- gather client-level stats ----
+        client_logs = strategy.get_round_logs(server_round)  # type: ignore[attr-defined]
+        n_clients = len(client_logs)
+
+        client_times = [float(v.get("round_time_sec", 0.0)) for v in client_logs.values()]
+        max_client_time = max(client_times) if client_times else 0.0
+        mean_client_time = sum(client_times) / len(client_times) if client_times else 0.0
+
+        # mean train loss per client = last epoch loss
+        client_final_losses: List[float] = []
+        for v in client_logs.values():
+            losses = v.get("epoch_losses", [])
+            client_final_losses.append(float(losses[-1]) if losses else 0.0)
+
+        mean_train_loss = sum(client_final_losses) / len(client_final_losses) if client_final_losses else 0.0
+        if len(client_final_losses) > 1:
+            variance = sum((x - mean_train_loss) ** 2 for x in client_final_losses) / len(client_final_losses)
+            std_train_loss = variance ** 0.5
+        else:
+            std_train_loss = 0.0
+
+        # ---- communication cost ----
+        comm_down_mb = (model_bytes * n_clients) / 1e6
+        comm_up_mb = (model_bytes * n_clients) / 1e6
+        cum_comm_mb += comm_down_mb + comm_up_mb
+
+        # ---- round wall time ----
+        round_start = strategy._round_start_times.get(server_round, run_start_time)  # type: ignore[attr-defined]
+        round_wall_time = time.time() - round_start
+
+        # ---- write rounds.csv row ----
+        with rounds_csv_path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                server_round, f"{acc:.6f}", f"{loss:.6f}", n_clients,
+                f"{comm_down_mb:.4f}", f"{comm_up_mb:.4f}", f"{cum_comm_mb:.4f}",
+                f"{round_wall_time:.2f}", f"{max_client_time:.2f}", f"{mean_client_time:.2f}",
+                f"{mean_train_loss:.6f}", f"{std_train_loss:.6f}",
+            ])
+
+        # ---- write clients.csv rows ----
+        with clients_csv_path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            for cid, v in sorted(client_logs.items()):
+                losses = v.get("epoch_losses", [])
+                final_loss = float(losses[-1]) if losses else 0.0
+                writer.writerow([
+                    server_round, cid,
+                    v.get("num_examples", 0),
+                    v.get("local_epochs", 0),
+                    f"{final_loss:.6f}",
+                    f"{v.get('round_time_sec', 0.0):.2f}",
+                ])
+
+        # ---- accumulate for summary ----
+        all_round_accs.append((server_round, float(acc)))
+
+        # ---- write summary.json on last round ----
+        if server_round == num_rounds:
+            total_wall_time = time.time() - run_start_time
+
+            best_round, best_acc = max(all_round_accs, key=lambda x: x[1])
+
+            def rounds_to_target(target: float) -> Optional[int]:
+                for r, a in all_round_accs:
+                    if a >= target:
+                        return r
+                return None
+
+            summary: Dict[str, Any] = {
+                "exp_name": exp_name,
+                "best_test_acc": float(best_acc),
+                "best_round": int(best_round),
+                "rounds_to_80pct": rounds_to_target(0.80),
+                "rounds_to_90pct": rounds_to_target(0.90),
+                "rounds_to_95pct": rounds_to_target(0.95),
+                "total_comm_mb": float(cum_comm_mb),
+                "total_wall_time_sec": float(total_wall_time),
+                "final_std_train_loss": float(std_train_loss),
+                "train_config": run_config_snapshot,
+            }
+            summary_json_path.write_text(
+                json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+
         return metrics
 
     # ---- start ----
@@ -516,5 +650,8 @@ def main(grid: Grid, context: Context) -> None:
     torch.save(result.arrays.to_torch_state_dict(), str(final_model_path))
     print("\nSaved final model to:", final_model_path.resolve())
     print("Saved log to:", log_path.resolve())
+    print("Saved rounds CSV to:", rounds_csv_path.resolve())
+    print("Saved clients CSV to:", clients_csv_path.resolve())
+    print("Saved summary JSON to:", summary_json_path.resolve())
     print("Saved partition plot to:", partition_plot_path.resolve())
     print("Experiment folder:", experiment_dir.resolve())
