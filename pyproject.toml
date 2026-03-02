@@ -49,7 +49,7 @@ fraction-train = 1.0
 fraction-evaluate = 0.0     # <-- важно: клиенты НЕ валидируют (валидация на сервере через evaluate_fn)
 
 # Aggregation strategy
-aggregation = "fedadam"          # варианты: fedavg; fedavgm; fedadam; fedyogi; fedadagrad; fedmedian; fedtrimmedavg; krum; multikrum; bulyan
+aggregation = "fedadam"          # варианты: fedavg; fedprox; fedavgm; fedadam; fedyogi; fedadagrad; fedmedian; fedtrimmedavg; krum; multikrum; bulyan
 # --- опционально, параметры под стратегии ---
 server-learning-rate = 1.0      # для fedavgm
 server-momentum = 0.9           # для fedavgm
@@ -63,6 +63,7 @@ server-tau = 1e-9               # fedadam/fedyogi/fedadagrad
 trimmed-beta = 0.2              # fedtrimmedavg
 num-malicious-nodes = 0         # krum/multikrum/bulyan
 num-nodes-to-select = 1         # multikrum
+mu = 0.01                       # fedprox proximal term coefficient
 
 #logs
 num-clients = 10

@@ -137,11 +137,25 @@ def train(msg: Message, context: Context) -> Message:
     img_col = meta["img_col"]
     label_col = meta["label_col"]
 
+    # ---- FedProx proximal term ----
+    try:
+        mu = float(msg.content["config"]["proximal-mu"])
+    except Exception:
+        mu = 0.0
+
+    global_params = None
+    if mu > 0.0:
+        global_params = [p.data.clone() for p in model.parameters()]
+
     # ---- epoch-wise training ----
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(
         model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay
     )
+
+    use_prox = mu > 0.0 and global_params is not None
+    if use_prox:
+        global_params_dev = [p.to(device) for p in global_params]  # type: ignore[union-attr]
 
     epoch_losses: List[float] = []
 
@@ -159,6 +173,14 @@ def train(msg: Message, context: Context) -> Message:
             optimizer.zero_grad(set_to_none=True)
             logits = model(x)
             loss = criterion(logits, y)
+
+            if use_prox:
+                prox_loss = sum(
+                    (w - w_g).pow(2).sum()
+                    for w, w_g in zip(model.parameters(), global_params_dev)
+                )
+                loss = loss + (mu / 2) * prox_loss
+
             loss.backward()
             optimizer.step()
 

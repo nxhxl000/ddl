@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Literal, Optional, Any, Tuple, Dict
+from typing import Callable, List, Literal, Optional, Any, Tuple, Dict
 
 from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 from flwr_datasets.partitioner import DirichletPartitioner, IidPartitioner, Partitioner
@@ -10,8 +10,12 @@ from flwr_datasets.visualization import plot_label_distributions
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
+
+try:
+    from fl_app.models import SimpleCNN, LeNet5
+except Exception:
+    from models import SimpleCNN, LeNet5  # type: ignore
 
 
 SplitScheme = Literal["iid", "dirichlet"]
@@ -31,6 +35,7 @@ class TrainHParams:
     momentum: float = 0.9
     weight_decay: float = 0.0
     num_workers: int = 0
+    mu: float = 0.0
 
 
 def default_hparams(dataset: str) -> TrainHParams:
@@ -279,33 +284,10 @@ def make_server_testloader(
 
 
 def create_model(dataset: str) -> nn.Module:
-    """
-    Одна и та же модель для MNIST и CIFAR-10.
-    - MNIST: 1 канал
-    - CIFAR-10: 3 канала
-    """
-    dataset = dataset.lower()
-    in_channels = 1 if dataset.startswith("mnist") else 3
-    num_classes = 10
-
-    class Net(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.conv1 = nn.Conv2d(in_channels, 32, 3, padding=1)
-            self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
-            self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
-            self.pool = nn.MaxPool2d(2)
-            self.gap = nn.AdaptiveAvgPool2d((1, 1))
-            self.fc = nn.Linear(128, num_classes)
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            x = self.pool(F.relu(self.conv1(x)))
-            x = self.pool(F.relu(self.conv2(x)))
-            x = F.relu(self.conv3(x))
-            x = self.gap(x).flatten(1)
-            return self.fc(x)
-
-    return Net()
+    """MNIST → LeNet5, CIFAR-10 → SimpleCNN(in_channels=3)."""
+    if dataset.lower().startswith("mnist"):
+        return LeNet5()
+    return SimpleCNN(in_channels=3)
 
 
 def train_one_client(
@@ -319,8 +301,14 @@ def train_one_client(
     label_col: str,
     momentum: float = 0.9,
     weight_decay: float = 0.0,
+    global_params: Optional[List[torch.Tensor]] = None,
+    mu: float = 0.0,
 ) -> float:
-    """Клиентское обучение. Возвращает средний train loss."""
+    """Клиентское обучение. Возвращает средний train loss.
+
+    Если mu > 0 и global_params заданы — добавляет FedProx proximal term:
+    prox = (mu/2) * sum ||w - w_global||^2
+    """
     model.to(device)
     model.train()
 
@@ -328,6 +316,10 @@ def train_one_client(
     optimizer = torch.optim.SGD(
         model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay
     )
+
+    use_prox = mu > 0.0 and global_params is not None
+    if use_prox:
+        global_params_dev = [p.to(device) for p in global_params]  # type: ignore[union-attr]
 
     total_loss = 0.0
     total_batches = 0
@@ -340,6 +332,14 @@ def train_one_client(
             optimizer.zero_grad(set_to_none=True)
             logits = model(x)
             loss = criterion(logits, y)
+
+            if use_prox:
+                prox_loss = sum(
+                    (w - w_g).pow(2).sum()
+                    for w, w_g in zip(model.parameters(), global_params_dev)
+                )
+                loss = loss + (mu / 2) * prox_loss
+
             loss.backward()
             optimizer.step()
 
