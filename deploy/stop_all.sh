@@ -34,8 +34,8 @@ for ip in "${ALL_IPS[@]}"; do
   ssh_cmd "$ip" "
     tmux kill-session -t superlink 2>/dev/null && echo 'superlink stopped' || true
     tmux kill-session -t supernode 2>/dev/null && echo 'supernode stopped' || true
-    pkill -f 'flwr superlink' 2>/dev/null || true
-    pkill -f 'flwr supernode' 2>/dev/null || true
+    pkill -f 'flower-superlink' 2>/dev/null || true
+    pkill -f 'flower-supernode' 2>/dev/null || true
     echo 'Done on \$(hostname)'
   " 2>&1 | sed "s/^/[$ip] /" &
 done
