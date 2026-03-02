@@ -47,6 +47,8 @@ min-partition-size = 0
 # Federated selection
 fraction-train = 1.0
 fraction-evaluate = 0.0     # <-- важно: клиенты НЕ валидируют (валидация на сервере через evaluate_fn)
+min-train-nodes = 5         # ждать все 5 клиентов перед стартом раунда
+min-available-nodes = 5     # не начинать пока не подключатся все 5
 
 # Aggregation strategy
 aggregation = "fedadam"          # варианты: fedavg; fedprox; fedavgm; fedadam; fedyogi; fedadagrad; fedmedian; fedtrimmedavg; krum; multikrum; bulyan
@@ -66,12 +68,16 @@ num-nodes-to-select = 1         # multikrum
 mu = 0.01                       # fedprox proximal term coefficient
 
 #logs
-num-clients = 10
+num-clients = 5
 partition-plot-type = "heatmap"   # или "bar"
 partition-size-unit = "percent"   # или "absolute"
 
 [tool.flwr.federations]
 default = "local-simulation"
+
+[tool.flwr.federations.yandex-cloud]
+address = "84.201.165.255:9093"
+insecure = true
 
 [tool.flwr.federations.local-simulation]
 options.num-supernodes = 10
