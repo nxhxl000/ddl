@@ -42,6 +42,7 @@ results/
 logs/
 reports/
 models/
+local_exp/
 
 # Model checkpoints
 *.pt
@@ -60,3 +61,8 @@ models/
 # =========================
 .DS_Store
 Thumbs.db
+
+# =========================
+# Claude Code
+# =========================
+CLAUDE.md
