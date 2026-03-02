@@ -231,16 +231,18 @@ def _make_logging_strategy_cls(base_cls: Type[Any]) -> Type[Any]:
             per_round: Dict[int, Dict[str, Any]] = {}
             for rep in replies_list:
                 src = rep.metadata.src_node_id
-                if rep.content is None or "details" not in rep.content:
+                if rep.content is None or "metrics" not in rep.content:
                     continue
 
-                details: ConfigRecord = rep.content["details"]  # type: ignore[assignment]
-                cid = int(details.get("partition-id", src))
+                m: MetricRecord = rep.content["metrics"]  # type: ignore[assignment]
+                cid = int(m.get("partition-id", float(src)))
+                last_loss = float(m.get("last-epoch-loss", m.get("train_loss", 0.0)))
+                first_loss = float(m.get("first-epoch-loss", last_loss))
                 per_round[cid] = {
-                    "epoch_losses": list(details.get("epoch-train-losses", [])),
-                    "round_time_sec": float(details.get("round-time-sec", 0.0)),
-                    "local_epochs": int(details.get("local-epochs", 0)),
-                    "num_examples": int(details.get("num-examples", 0)),
+                    "epoch_losses": [first_loss, last_loss],
+                    "round_time_sec": float(m.get("round-time-sec", 0.0)),
+                    "local_epochs": int(m.get("local-epochs", 0.0)),
+                    "num_examples": int(m.get("num-examples", 0.0)),
                     "src_node_id": int(src),
                 }
 
@@ -518,8 +520,9 @@ def main(grid: Grid, context: Context) -> None:
                 time_sec = float(payload.get("round_time_sec", 0.0))
 
                 f.write(f"    Client{cid + 1}:\n")
-                for i, loss in enumerate(epoch_losses):
-                    f.write(f"        loc_epoch {i}: train loss - {float(loss):.6f}\n")
+                if epoch_losses:
+                    f.write(f"        loc_epoch 0: train loss - {float(epoch_losses[0]):.6f}\n")
+                    f.write(f"        loc_epoch last: train loss - {float(epoch_losses[-1]):.6f}\n")
                 f.write(f"        time on round {server_round} - {time_sec:.2f}s\n")
 
             test_acc = float(server_metrics.get("test_acc", 0.0))
