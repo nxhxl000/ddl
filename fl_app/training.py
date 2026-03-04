@@ -29,18 +29,29 @@ def make_dataloader(
     *,
     shuffle: bool,
     num_workers: int = 0,
+    augment: bool = False,
 ) -> Tuple[DataLoader, str, str]:
-    """Загрузить партицию с диска и вернуть DataLoader + имена колонок."""
-    from torchvision.transforms import ToTensor
+    """Загрузить партицию с диска и вернуть DataLoader + имена колонок.
+
+    augment=True: для RGB-изображений (CIFAR-10) добавляет RandomCrop(32, padding=4)
+    и RandomHorizontalFlip перед ToTensor. Для grayscale (MNIST) — только ToTensor.
+    """
+    from torchvision.transforms import Compose, RandomCrop, RandomHorizontalFlip, ToTensor
 
     ds = load_from_disk(str(partition_path))
     img_col, label_col = _infer_columns(ds)
 
-    def to_tensor(batch):
-        batch[img_col] = [ToTensor()(x) for x in batch[img_col]]
+    # Определяем transform один раз по первому изображению
+    if augment and getattr(ds[0][img_col], "mode", None) == "RGB":
+        transform = Compose([RandomCrop(32, padding=4), RandomHorizontalFlip(), ToTensor()])
+    else:
+        transform = ToTensor()
+
+    def apply_transform(batch):
+        batch[img_col] = [transform(x) for x in batch[img_col]]
         return batch
 
-    ds = ds.with_transform(to_tensor)
+    ds = ds.with_transform(apply_transform)
     loader = DataLoader(
         ds,
         batch_size=batch_size,
@@ -76,6 +87,7 @@ def local_train(
     optimizer = torch.optim.SGD(
         model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay
     )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.CrossEntropyLoss()
     global_params = (
         [p.data.clone().to(device) for p in model.parameters()] if mu > 0.0 else None
@@ -100,6 +112,7 @@ def local_train(
             loss_sum += float(loss.item())
             batches += 1
         epoch_losses.append(loss_sum / max(batches, 1))
+        scheduler.step()
 
     return epoch_losses, len(loader.dataset)
 
