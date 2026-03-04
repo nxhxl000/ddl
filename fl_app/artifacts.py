@@ -296,6 +296,8 @@ def generate_plots(
         capprops=dict(color="steelblue", linewidth=1.5),
         flierprops=dict(marker="o", color="gray", markersize=4, alpha=0.5),
     )
+    ax.plot(rounds, means, color="tomato", zorder=5, linewidth=1.5,
+            linestyle="--", alpha=0.8)
     ax.scatter(rounds, means, color="tomato", zorder=6,
                marker="D", s=50, label="Mean", linewidths=0.5, edgecolors="darkred")
 

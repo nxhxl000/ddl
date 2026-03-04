@@ -35,7 +35,7 @@ _CIFARCNN_HPARAMS = TrainHParams(
     batch_size=64,
     momentum=0.9,
     weight_decay=1e-4,
-    num_workers=2,
+    num_workers=0,
 )
 
 # LeNet-5 — классическая CNN для MNIST (grayscale, 28×28)
@@ -49,7 +49,7 @@ _LENET5_HPARAMS = TrainHParams(
     batch_size=64,
     momentum=0.9,
     weight_decay=0.0,
-    num_workers=2,
+    num_workers=0,
 )
 
 

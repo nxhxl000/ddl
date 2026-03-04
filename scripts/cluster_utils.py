@@ -56,6 +56,7 @@ def load_nodes(conf_path: str = "deploy/nodes.conf") -> dict[str, Any]:
         "ssh_key":     str(ssh_key),
         "ssh_key_win": raw.get("SSH_KEY_WIN", "/mnt/c/Users/listr/.ssh/admin-fl"),
         "server_ext":  raw["SERVER_EXT"],
+        "server_int":  raw.get("SERVER_INT", raw["SERVER_EXT"]),
         "remote_dir":  raw.get("REMOTE_DIR", "/home/gleb/ddl"),
     }
 
@@ -140,6 +141,16 @@ def rsync_to_server(cfg: dict, src: str, dst: str, *, timeout: int = 60) -> subp
     remote = f"{cfg['ssh_user']}@{cfg['server_ext']}:{dst}"
     return subprocess.run(
         ["rsync", "-az", "-e", ssh_cmd, src, remote],
+        timeout=timeout,
+    )
+
+
+def rsync_from_server(cfg: dict, src: str, dst: str, *, timeout: int = 60) -> subprocess.CompletedProcess:
+    """rsync папки src с сервера на локальную машину в dst."""
+    ssh_cmd = f"ssh -i {cfg['ssh_key']} " + " ".join(_BASE_SSH_OPTS)
+    remote = f"{cfg['ssh_user']}@{cfg['server_ext']}:{src}"
+    return subprocess.run(
+        ["rsync", "-az", "--info=progress2", "-e", ssh_cmd, remote, dst],
         timeout=timeout,
     )
 
