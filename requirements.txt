@@ -1,8 +1,8 @@
 # =========================
 # Federated Learning (Flower)
 # =========================
-flwr[simulation]==1.22.0
-flwr-datasets[vision]>=0.5.0
+flwr==1.22.0
+datasets>=2.0.0
 
 # =========================
 # ML framework
@@ -29,6 +29,8 @@ rich
 # =========================
 pytest
 ruff
+jupyterlab
+nbstripout
 
 # -------------------------
 # GPU (CUDA 12.8 nightly) — Если хотите использовать CUDA узлы
