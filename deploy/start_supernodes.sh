@@ -21,10 +21,8 @@ for IDX in "${!CLIENT_INT_IPS[@]}"; do
 
   ssh_client "$int_ip" "
     tmux kill-session -t $SESSION 2>/dev/null || true
-    tmux new-session -d -s $SESSION
-    tmux send-keys -t $SESSION \
-      'cd $REMOTE_DIR && source .venv/bin/activate && flower-supernode --superlink $SERVER_INT:9092 --insecure --node-config \"partition-id=$IDX\" --node-config \"num-partitions=$NUM_PARTITIONS\"' \
-      Enter
+    tmux new-session -d -s $SESSION \
+      \"bash -c 'cd $REMOTE_DIR && source .venv/bin/activate && exec flower-supernode --superlink $SERVER_INT:9092 --insecure --node-config \"partition-id=$IDX num-partitions=$NUM_PARTITIONS\"'\"
     echo 'SuperNode partition-id=$IDX started on '\$(hostname)
   " && log "  ✓ $name OK" \
     || log "  ✗ $name FAILED"

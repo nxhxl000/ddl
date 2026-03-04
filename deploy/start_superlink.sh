@@ -14,9 +14,8 @@ source .venv/bin/activate
 # Убиваем старую сессию если есть
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
-tmux new-session -d -s "$SESSION"
-tmux send-keys -t "$SESSION" \
-  "cd $REPO_DIR && source .venv/bin/activate && flower-superlink --insecure" Enter
+tmux new-session -d -s "$SESSION" \
+  "bash -c 'cd $REPO_DIR && source .venv/bin/activate && exec flower-superlink --insecure'"
 
 echo "SuperLink started in tmux session '$SESSION'"
 echo "Attach: tmux attach -t $SESSION"

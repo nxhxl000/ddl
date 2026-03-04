@@ -120,7 +120,7 @@ def _make_logging_cls(base_cls: Type) -> Type:
 
             for rep in replies_list:
                 src = rep.metadata.src_node_id
-                if rep.content is None or "metrics" not in rep.content:
+                if not rep.has_content() or "metrics" not in rep.content:
                     continue
                 m: MetricRecord = rep.content["metrics"]  # type: ignore[assignment]
                 cid = int(m.get("partition-id", float(src)))
