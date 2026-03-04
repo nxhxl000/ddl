@@ -39,7 +39,7 @@ def train(msg: Message, context: Context) -> Message:
 
     device = get_device()
     loader, img_col, label_col = make_dataloader(
-        partition_path, hp.batch_size, shuffle=True, num_workers=hp.num_workers
+        partition_path, hp.batch_size, shuffle=True, num_workers=hp.num_workers, augment=True
     )
 
     # Сохраняем глобальные веса до обучения — для вычисления drift
