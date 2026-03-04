@@ -14,8 +14,8 @@ description = "Federated Learning app"
 license = "Apache-2.0"
 
 dependencies = [
-    "flwr[simulation]>=1.22.0",
-    "flwr-datasets[vision]>=0.5.0",
+    "flwr>=1.22.0",
+    "datasets>=2.0.0",
     "torch==2.7.1",
     "torchvision==0.22.1",
 ]
@@ -31,56 +31,27 @@ serverapp = "fl_app.server_app:app"
 clientapp = "fl_app.client_app:app"
 
 # -----------------------------------------------------
-# Run config (передаётся в context.run_config)
+# Experiment config — только "что запускать"
+# Гиперпараметры модели → fl_app/models.py
+# Параметры стратегии   → fl_app/strategies.py
 # -----------------------------------------------------
 [tool.flwr.app.config]
-# Data
-dataset = "cifar10"       # cifar10 | mnist
-data-dir = "data/"
+partition-name      = "cifar10__dirichlet__a0.9__m30__n5__s42"
+model               = "cifarcnn"    # cifarcnn | lenet5
+aggregation         = "fedavg"      # fedavg | fedprox | fedavgm | fedadam | fedyogi | fedadagrad | fedmedian | fedtrimmedavg | krum | multikrum | bulyan
 
-# Partitioning
-scheme = "iid"              # "iid" | "dirichlet"
-alpha = 0.3                 # используется только при scheme="dirichlet"
-seed = 42
-min-partition-size = 0
+# FL infrastructure
+num-server-rounds   = 10
+fraction-train      = 1.0
+min-train-nodes     = 5
+min-available-nodes = 5
 
-# Federated selection
-fraction-train = 1.0
-fraction-evaluate = 0.0     # <-- важно: клиенты НЕ валидируют (валидация на сервере через evaluate_fn)
-min-train-nodes = 5         # ждать все 5 клиентов перед стартом раунда
-min-available-nodes = 5     # не начинать пока не подключатся все 5
-
-# Aggregation strategy
-aggregation = "fedadam"          # варианты: fedavg; fedprox; fedavgm; fedadam; fedyogi; fedadagrad; fedmedian; fedtrimmedavg; krum; multikrum; bulyan
-# --- опционально, параметры под стратегии ---
-server-learning-rate = 1.0      # для fedavgm
-server-momentum = 0.9           # для fedavgm
-
-server-eta = 0.01               # для fedadam/fedyogi/fedadagrad (server lr)
-server-eta-l = 0.001            # "client lr" параметр FedOpt (обычно = реальному lr клиента)
-server-beta1 = 0.9              # fedadam/fedyogi
-server-beta2 = 0.99             # fedadam/fedyogi
-server-tau = 1e-9               # fedadam/fedyogi/fedadagrad
-
-trimmed-beta = 0.2              # fedtrimmedavg
-num-malicious-nodes = 0         # krum/multikrum/bulyan
-num-nodes-to-select = 1         # multikrum
-mu = 0.01                       # fedprox proximal term coefficient
-
-#logs
-num-clients = 5
-partition-plot-type = "heatmap"   # или "bar"
-partition-size-unit = "percent"   # или "absolute"
+local-epochs = 5        # локальных эпох обучения на каждом клиенте за раунд
+data-dir     = "data/"
 
 [tool.flwr.federations]
-default = "local-simulation"
+default = "yandex-cloud"
 
 [tool.flwr.federations.yandex-cloud]
 address = "84.201.165.255:9093"
 insecure = true
-
-[tool.flwr.federations.local-simulation]
-options.num-supernodes = 10
-options.num-rounds = 10  
-options.backend.client-resources.num-cpus = 2
-options.backend.client-resources.num-gpus = 1.0  # если нет GPU — поставь 0.0

@@ -1,216 +1,79 @@
 from __future__ import annotations
 
 import time
-from functools import lru_cache
-from typing import Any, List
+from pathlib import Path
 
 import torch
-import torch.nn as nn
-from flwr.app import ArrayRecord, ConfigRecord, Context, Message, MetricRecord, RecordDict
+from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict
 from flwr.clientapp import ClientApp
 
-# Поддержим оба варианта: task.py в корне или fl_app/task.py
-try:
-    from fl_app.task import (
-        create_model,
-        get_device,
-        prepare_federated_dataset,
-        make_client_trainloader,
-        default_hparams,  # <-- NEW
-    )
-except Exception:  # pragma: no cover
-    from task import (  # type: ignore
-        create_model,
-        get_device,
-        prepare_federated_dataset,
-        make_client_trainloader,
-        default_hparams,  # <-- NEW
-    )
-
-
-def _rc(context: Context, *keys: str, default: Any = None) -> Any:
-    for k in keys:
-        try:
-            return context.run_config[k]
-        except KeyError:
-            pass
-    return default
-
-
-def _nc(context: Context, key: str, default: Any = None) -> Any:
-    try:
-        return context.node_config[key]
-    except KeyError:
-        return default
-
-
-@lru_cache(maxsize=8)
-def _cached_fed(
-    dataset: str,
-    num_clients: int,
-    scheme: str,
-    alpha: float,
-    seed: int,
-    data_dir: str,
-    min_partition_size: int,
-):
-    return prepare_federated_dataset(
-        dataset=dataset,
-        num_clients=num_clients,
-        scheme=scheme,
-        alpha=alpha,
-        seed=seed,
-        data_dir=data_dir,
-        split_train="train",
-        split_test="test",
-        min_partition_size=min_partition_size,
-    )
-
+from fl_app.models import build_model, get_hparams
+from fl_app.training import get_device, local_train, make_dataloader
 
 app = ClientApp()
 
 
 @app.train()
 def train(msg: Message, context: Context) -> Message:
-    # ---- run config ----
-    dataset_name: str = _rc(context, "dataset", "dataset_name", default="cifar10")
-    scheme: str = _rc(context, "scheme", "split_scheme", default="iid")  # iid/dirichlet
-    alpha: float = float(_rc(context, "alpha", default=0.3))
-    seed: int = int(_rc(context, "seed", default=42))
-    data_dir: str = _rc(context, "data-dir", "data_dir", default="data/")
+    rc = context.run_config
+    partition_name: str = rc["partition-name"]
+    model_name:     str = rc["model"]
+    local_epochs:   int = int(rc.get("local-epochs", 5))
+    data_dir:       str = rc.get("data-dir", "data/")
 
-    # ---- defaults from task.py ----
-    hp = default_hparams(dataset_name)
+    partition_id = int(context.node_config.get("partition-id", 0))
+    partition_path = Path(data_dir) / "partitions" / partition_name / f"client_{partition_id}"
 
-    batch_size: int = int(_rc(context, "batch-size", "batch_size", default=hp.batch_size))
-    local_epochs: int = int(_rc(context, "local-epochs", "local_epochs", default=hp.local_epochs))
-    num_workers: int = int(_rc(context, "num-workers", "num_workers", default=hp.num_workers))
+    # Гиперпараметры из реестра моделей
+    hp = get_hparams(model_name)
 
-    momentum: float = float(_rc(context, "momentum", default=hp.momentum))
-    weight_decay: float = float(_rc(context, "weight_decay", default=hp.weight_decay))
-
-    min_partition_size: int = int(
-        _rc(context, "min-partition-size", "min_partition_size", default=0)
-    )
-
-    # lr может приходить от сервера (train_config)
-    lr_default: float = float(_rc(context, "learning-rate", "lr", default=hp.lr))
-    try:
-        lr: float = float(msg.content["config"]["learning-rate"])
-    except Exception:
-        try:
-            lr = float(msg.content["config"]["lr"])
-        except Exception:
-            lr = lr_default
-
-    # ---- node config ----
-    partition_id = int(_nc(context, "partition-id", 0))
-    num_partitions = int(_nc(context, "num-partitions", 1))
-
-    # ---- model ----
-    model = create_model(dataset_name)
+    # Загружаем веса от сервера
+    model = build_model(model_name)
     model.load_state_dict(msg.content["arrays"].to_torch_state_dict())
 
-    device = get_device(prefer_cuda=True)
-    model.to(device)
-
-    # ---- data ----
-    fed = _cached_fed(
-        dataset=dataset_name,
-        num_clients=num_partitions,
-        scheme=scheme,
-        alpha=alpha,
-        seed=seed,
-        data_dir=data_dir,
-        min_partition_size=min_partition_size,
-    )
-
-    trainloader, meta = make_client_trainloader(
-        fed=fed,
-        cid=partition_id,
-        train_transform=None,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        shuffle=True,
-    )
-
-    img_col = meta["img_col"]
-    label_col = meta["label_col"]
-
-    # ---- FedProx proximal term ----
+    # FedProx mu (приходит от сервера если стратегия = fedprox, иначе 0)
     try:
         mu = float(msg.content["config"]["proximal-mu"])
     except Exception:
         mu = 0.0
 
-    global_params = None
-    if mu > 0.0:
-        global_params = [p.data.clone() for p in model.parameters()]
-
-    # ---- epoch-wise training ----
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(
-        model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay
+    device = get_device()
+    loader, img_col, label_col = make_dataloader(
+        partition_path, hp.batch_size, shuffle=True, num_workers=hp.num_workers
     )
 
-    use_prox = mu > 0.0 and global_params is not None
-    if use_prox:
-        global_params_dev = [p.to(device) for p in global_params]  # type: ignore[union-attr]
-
-    epoch_losses: List[float] = []
+    # Сохраняем глобальные веса до обучения — для вычисления drift
+    global_weights = [p.data.clone() for p in model.parameters()]
 
     t0 = time.perf_counter()
-    model.train()
-
-    for _ep in range(local_epochs):
-        loss_sum = 0.0
-        batches = 0
-
-        for batch in trainloader:
-            x = batch[img_col].to(device)
-            y = batch[label_col].to(device)
-
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(x)
-            loss = criterion(logits, y)
-
-            if use_prox:
-                prox_loss = sum(
-                    (w - w_g).pow(2).sum()
-                    for w, w_g in zip(model.parameters(), global_params_dev)
-                )
-                loss = loss + (mu / 2) * prox_loss
-
-            loss.backward()
-            optimizer.step()
-
-            loss_sum += float(loss.item())
-            batches += 1
-
-        epoch_loss = loss_sum / max(batches, 1)
-        epoch_losses.append(epoch_loss)
-
-    round_time_sec = time.perf_counter() - t0
-
-    avg_train_loss = float(sum(epoch_losses) / max(len(epoch_losses), 1))
-    num_examples = int(len(trainloader.dataset))
-
-    # ---- reply ----
-    arrays = ArrayRecord(model.state_dict())
-
-    # Все метаданные кладём в MetricRecord — ConfigRecord не всегда
-    # пробрасывается через distributed pipeline (SuperNode → SuperLink → ServerApp)
-    metrics = MetricRecord(
-        {
-            "train_loss": avg_train_loss,
-            "num-examples": float(num_examples),
-            "partition-id": float(partition_id),
-            "local-epochs": float(local_epochs),
-            "round-time-sec": float(round_time_sec),
-            "first-epoch-loss": float(epoch_losses[0]) if epoch_losses else 0.0,
-            "last-epoch-loss": float(epoch_losses[-1]) if epoch_losses else 0.0,
-        }
+    epoch_losses, num_examples = local_train(
+        model, loader,
+        device=device,
+        epochs=local_epochs,
+        lr=hp.lr,
+        momentum=hp.momentum,
+        weight_decay=hp.weight_decay,
+        img_col=img_col,
+        label_col=label_col,
+        mu=mu,
     )
+    round_time = time.perf_counter() - t0
 
-    content = RecordDict({"arrays": arrays, "metrics": metrics})
-    return Message(content=content, reply_to=msg)
+    # Client drift: ||w_local - w_global||_F
+    drift = torch.sqrt(sum(
+        (p.data.cpu() - wg).pow(2).sum()
+        for p, wg in zip(model.parameters(), global_weights)
+    )).item()
+
+    arrays  = ArrayRecord(model.state_dict())
+    metrics = MetricRecord({
+        "train_loss":       float(sum(epoch_losses) / max(len(epoch_losses), 1)),
+        "num-examples":     float(num_examples),
+        "partition-id":     float(partition_id),
+        "local-epochs":     float(local_epochs),
+        "round-time-sec":   float(round_time),
+        "first-epoch-loss": float(epoch_losses[0])  if epoch_losses else 0.0,
+        "last-epoch-loss":  float(epoch_losses[-1]) if epoch_losses else 0.0,
+        "drift":            float(drift),
+    })
+    return Message(content=RecordDict({"arrays": arrays, "metrics": metrics}), reply_to=msg)
