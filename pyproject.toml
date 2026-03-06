@@ -36,17 +36,17 @@ clientapp = "fl_app.client_app:app"
 # Параметры стратегии   → fl_app/strategies.py
 # -----------------------------------------------------
 [tool.flwr.app.config]
-partition-name      = "cifar10__dirichlet__a0.9__m30__n5__s42"
+partition-name      = "cifar10__dirichlet__a0.3__m30__n6__s42"
 model               = "cifarcnn"    # cifarcnn | lenet5
-aggregation         = "fedavg"      # fedavg | fedprox | fedavgm | fedadam | fedyogi | fedadagrad | fedmedian | fedtrimmedavg | krum | multikrum | bulyan
+aggregation         = "fedprox"      # fedavg | fedprox | fedavgm | fedadam | fedyogi | fedadagrad | fedmedian | fedtrimmedavg | krum | multikrum | bulyan
 
 # FL infrastructure
-num-server-rounds   = 10
+num-server-rounds   = 20
 fraction-train      = 1.0
-min-train-nodes     = 5
-min-available-nodes = 5
+min-train-nodes     = 6
+min-available-nodes = 6
 
-local-epochs = 5        # локальных эпох обучения на каждом клиенте за раунд
+local-epochs = 3        # локальных эпох обучения на каждом клиенте за раунд
 data-dir     = "data/"
 
 [tool.flwr.federations]

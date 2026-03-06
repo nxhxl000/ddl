@@ -38,6 +38,7 @@ def load_nodes(conf_path: str = "deploy/nodes.conf") -> dict[str, Any]:
             "ext_ip":       ext_ip,
             "role":         "client",
             "partition_id": i - 1,
+            "cores":        int(raw.get(f"CLIENT_{i}_CORES", 1)),
         })
         i += 1
 

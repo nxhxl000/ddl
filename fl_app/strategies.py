@@ -109,12 +109,12 @@ def _make_logging_cls(base_cls: Type) -> Type:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
             self.round_client_logs: Dict[int, Dict[int, Dict[str, Any]]] = {}
-            self._round_start_times: Dict[int, float] = {}
+            self._agg_start_times: Dict[int, float] = {}
+            self._agg_end_times:   Dict[int, float] = {}
 
         def aggregate_train(
             self, server_round: int, replies: Iterable[Message]
         ) -> Tuple[Optional[ArrayRecord], Optional[MetricRecord]]:
-            self._round_start_times[server_round] = time.time()
             replies_list = list(replies)
             per_round: Dict[int, Dict[str, Any]] = {}
 
@@ -135,7 +135,10 @@ def _make_logging_cls(base_cls: Type) -> Type:
                 }
 
             self.round_client_logs[server_round] = per_round
-            return super().aggregate_train(server_round, replies_list)
+            self._agg_start_times[server_round] = time.time()
+            result = super().aggregate_train(server_round, replies_list)
+            self._agg_end_times[server_round] = time.time()
+            return result
 
         def get_round_logs(self, server_round: int) -> Dict[int, Dict[str, Any]]:
             return self.round_client_logs.get(server_round, {})

@@ -88,7 +88,7 @@ def init_csvs(rounds_path: Path, clients_path: Path, classes_path: Path) -> None
         csv.writer(f).writerow([
             "round", "test_acc", "delta_acc", "test_loss", "n_clients",
             "comm_down_mb", "comm_up_mb", "cum_comm_mb",
-            "round_wall_time_sec",
+            "train_time_sec", "agg_time_sec", "eval_time_sec", "round_total_time_sec",
             "max_client_time_sec", "mean_client_time_sec",
             "min_client_time_sec", "std_client_time_sec",
             "mean_train_loss", "std_train_loss",
@@ -98,7 +98,7 @@ def init_csvs(rounds_path: Path, clients_path: Path, classes_path: Path) -> None
         csv.writer(f).writerow([
             "round", "client_id", "num_examples", "local_epochs",
             "train_loss_last", "train_loss_first", "local_improvement",
-            "round_time_sec", "drift",
+            "round_time_sec", "sec_per_1k", "drift",
         ])
     with classes_path.open("w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([
@@ -113,17 +113,24 @@ def log_round(
     client_logs: Dict[int, Dict[str, Any]],
     test_acc: float,
     test_loss: float,
+    train_time: float = 0.0,
+    agg_time: float = 0.0,
+    eval_time: float = 0.0,
 ) -> None:
     with log_path.open("a", encoding="utf-8") as f:
         f.write(f"Round {server_round}:\n")
         for cid in sorted(client_logs):
             p = client_logs[cid]
             improvement = p["first_epoch_loss"] - p["last_epoch_loss"]
+            n = p["num_examples"]
+            sec_per_1k = p["round_time_sec"] / n * 1000 if n > 0 else 0.0
             f.write(f"  Client {cid + 1}:\n")
             f.write(f"    first epoch loss : {p['first_epoch_loss']:.6f}\n")
             f.write(f"    last  epoch loss : {p['last_epoch_loss']:.6f}  (Δ {improvement:+.6f})\n")
             f.write(f"    drift ||Δw||     : {p['drift']:.6f}\n")
-            f.write(f"    round time       : {p['round_time_sec']:.2f}s\n")
+            f.write(f"    train time       : {p['round_time_sec']:.2f}s  ({sec_per_1k:.2f}s/1k examples)\n")
+        f.write(f"  Timing: train={train_time:.1f}s  agg={agg_time:.2f}s  eval={eval_time:.2f}s"
+                f"  total={train_time + agg_time + eval_time:.1f}s\n")
         f.write(f"  Server eval: acc={test_acc:.4f}  loss={test_loss:.6f}\n\n")
 
 
@@ -136,7 +143,9 @@ def append_rounds_row(
     loss: float,
     client_logs: Dict[int, Dict[str, Any]],
     model_bytes: int,
-    round_start_time: float,
+    train_time_sec: float,
+    agg_time_sec: float,
+    eval_time_sec: float,
     cum_comm_mb: float,
 ) -> float:
     """Добавить строку в rounds.csv. Возвращает обновлённый cum_comm_mb."""
@@ -161,13 +170,15 @@ def append_rounds_row(
         std_loss = math.sqrt(sum((x - mean_loss) ** 2 for x in losses) / n)
     mean_drift = sum(drifts) / n if n else 0.0
     max_drift  = max(drifts) if drifts else 0.0
+    round_total = train_time_sec + agg_time_sec + eval_time_sec
 
     with rounds_path.open("a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([
             server_round,
             f"{acc:.6f}", f"{delta_acc:+.6f}", f"{loss:.6f}", n,
             f"{comm_each:.4f}", f"{comm_each:.4f}", f"{cum_comm_mb:.4f}",
-            f"{time.time() - round_start_time:.2f}",
+            f"{train_time_sec:.2f}", f"{agg_time_sec:.2f}",
+            f"{eval_time_sec:.2f}", f"{round_total:.2f}",
             f"{max_t:.2f}", f"{mean_t:.2f}", f"{min_t:.2f}", f"{std_t:.2f}",
             f"{mean_loss:.6f}", f"{std_loss:.6f}",
             f"{mean_drift:.6f}", f"{max_drift:.6f}",
@@ -185,13 +196,16 @@ def append_client_rows(
         w = csv.writer(f)
         for cid, v in sorted(client_logs.items()):
             improvement = v["first_epoch_loss"] - v["last_epoch_loss"]
+            n = v["num_examples"]
+            sec_per_1k = v["round_time_sec"] / n * 1000 if n > 0 else 0.0
             w.writerow([
                 server_round, cid,
-                v["num_examples"], v["local_epochs"],
+                n, v["local_epochs"],
                 f"{v['last_epoch_loss']:.6f}",
                 f"{v['first_epoch_loss']:.6f}",
                 f"{improvement:.6f}",
                 f"{v['round_time_sec']:.2f}",
+                f"{sec_per_1k:.3f}",
                 f"{v['drift']:.6f}",
             ])
 
@@ -389,7 +403,7 @@ def print_summary_table(
         delta  = float(row["delta_acc"]) * 100
         loss   = float(row["test_loss"])
         drift  = float(row.get("mean_drift", 0.0))
-        rtime  = float(row.get("round_wall_time_sec", 0.0))
+        rtime  = float(row.get("round_total_time_sec", 0.0))
         print(
             f"  {r:>3}    {acc:>7.2f}%  {delta:>+8.2f}%  {loss:>8.4f}"
             f"  {drift:>10.4f}  {rtime:>8.1f}s"

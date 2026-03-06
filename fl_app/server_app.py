@@ -123,23 +123,33 @@ def main(grid: Grid, context: Context) -> None:
     def global_evaluate(server_round: int, arrays: ArrayRecord) -> MetricRecord:
         nonlocal cum_comm_mb, prev_acc
 
+        eval_start = time.time()
         model = build_model(model_name)
         model.load_state_dict(arrays.to_torch_state_dict())
         loss, acc, per_class = evaluate(
             model, testloader, device=device, img_col=img_col, label_col=label_col
         )
+        eval_time = time.time() - eval_start
 
         delta_acc   = acc - prev_acc
         prev_acc    = acc
         client_logs = strategy.get_round_logs(server_round)
-        round_start = strategy._round_start_times.get(server_round, run_start)
+
+        agg_start = strategy._agg_start_times.get(server_round, eval_start)
+        agg_end   = strategy._agg_end_times.get(server_round, agg_start)
+        agg_time  = agg_end - agg_start
+        train_time = max(
+            (v["round_time_sec"] for v in client_logs.values()), default=0.0
+        )
 
         log_round(log_path, server_round=server_round, client_logs=client_logs,
-                  test_acc=acc, test_loss=loss)
+                  test_acc=acc, test_loss=loss,
+                  train_time=train_time, agg_time=agg_time, eval_time=eval_time)
         cum_comm_mb = append_rounds_row(
             rounds_csv, server_round=server_round, acc=acc, delta_acc=delta_acc,
             loss=loss, client_logs=client_logs, model_bytes=model_bytes,
-            round_start_time=round_start, cum_comm_mb=cum_comm_mb,
+            train_time_sec=train_time, agg_time_sec=agg_time, eval_time_sec=eval_time,
+            cum_comm_mb=cum_comm_mb,
         )
         append_client_rows(clients_csv, server_round=server_round, client_logs=client_logs)
         append_classes_rows(
