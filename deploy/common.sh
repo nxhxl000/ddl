@@ -15,7 +15,7 @@ CLIENT_IPS=()
 CLIENT_INT_IPS=()
 _i=1
 while true; do
-  _v="CLIENT_$_i"; _ip="${!_v}"
+  _v="CLIENT_$_i"; _ip="${!_v:-}"
   [[ -z "$_ip" ]] && break
   CLIENT_IPS+=("$_ip")
   _vi="CLIENT_${_i}_INT";  CLIENT_INT_IPS+=("${!_vi:-$_ip}")

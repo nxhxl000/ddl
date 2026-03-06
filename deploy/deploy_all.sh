@@ -58,7 +58,7 @@ log "Rsync phase done."
 
 # 2. Setup — последовательно (сервер без датасетов, клиенты с датасетами)
 log "Running setup on fl-server..."
-ssh_server "bash $REMOTE_DIR/deploy/setup.sh --skip-data" \
+ssh_server "bash $REMOTE_DIR/deploy/setup.sh" \
   2>&1 | sed "s/^/[fl-server] /" \
   && ok "fl-server setup done" \
   || fail "fl-server setup FAILED"
