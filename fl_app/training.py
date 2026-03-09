@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import random
+from math import floor
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -11,6 +13,44 @@ from torch.utils.data import DataLoader
 
 def get_device() -> torch.device:
     return torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+
+
+def stratified_select(ds, budget: int, label_col: str, seed: int):
+    """Выбрать `budget` сэмплов из ds с сохранением распределения классов.
+
+    Каждый класс получает floor/ceil(budget * class_fraction) сэмплов,
+    выбранных с детерминированным перемешиванием (меняется по раундам).
+    Это предотвращает деградацию редких классов при чанкинге.
+    """
+    labels = ds[label_col]
+    n_total = len(labels)
+    budget = min(budget, n_total)
+
+    # Группируем индексы по классам
+    class_indices: Dict[int, List[int]] = {}
+    for i, lbl in enumerate(labels):
+        if lbl not in class_indices:
+            class_indices[lbl] = []
+        class_indices[lbl].append(i)
+
+    # Пропорциональная квота на каждый класс (floor + распределение остатка)
+    quotas_f = {cls: budget * len(idxs) / n_total for cls, idxs in class_indices.items()}
+    quotas   = {cls: floor(q) for cls, q in quotas_f.items()}
+    remainder = budget - sum(quotas.values())
+    # Остаток отдаём классам с наибольшей дробной частью
+    for cls in sorted(class_indices, key=lambda c: -(quotas_f[c] - quotas[c]))[:remainder]:
+        quotas[cls] += 1
+
+    # Перемешиваем каждый класс и берём квоту
+    rng = random.Random(seed)
+    selected: List[int] = []
+    for cls, idxs in class_indices.items():
+        rng.shuffle(idxs)
+        selected.extend(idxs[:quotas[cls]])
+
+    # Финальное перемешивание чтобы классы не шли блоками
+    rng.shuffle(selected)
+    return ds.select(selected)
 
 
 def _infer_columns(ds) -> Tuple[str, str]:
@@ -30,15 +70,19 @@ def make_dataloader(
     shuffle: bool,
     num_workers: int = 0,
     augment: bool = False,
+    dataset=None,
 ) -> Tuple[DataLoader, str, str]:
     """Загрузить партицию с диска и вернуть DataLoader + имена колонок.
 
     augment=True: для RGB-изображений (CIFAR-10) добавляет RandomCrop(32, padding=4)
     и RandomHorizontalFlip перед ToTensor. Для grayscale (MNIST) — только ToTensor.
+
+    dataset: опционально передать уже загруженный HF Dataset (напр., после shuffle+select).
+             Если задан, partition_path игнорируется.
     """
     from torchvision.transforms import Compose, RandomCrop, RandomHorizontalFlip, ToTensor
 
-    ds = load_from_disk(str(partition_path))
+    ds = dataset if dataset is not None else load_from_disk(str(partition_path))
     img_col, label_col = _infer_columns(ds)
 
     # Определяем transform один раз по первому изображению
@@ -74,26 +118,52 @@ def local_train(
     img_col: str,
     label_col: str,
     mu: float = 0.0,
-) -> Tuple[List[float], int]:
+    c_i: Optional[Dict[str, torch.Tensor]] = None,
+    c_server: Optional[Dict[str, torch.Tensor]] = None,
+) -> Tuple[List[float], int, int]:
     """Локальное обучение клиента.
 
     Args:
-        mu: коэффициент FedProx proximal term (0.0 = выключен).
+        mu:       FedProx proximal term (0.0 = выключен).
+        c_i:      SCAFFOLD client control variate {param_name: tensor}.
+        c_server: SCAFFOLD server control variate {param_name: tensor}.
 
     Returns:
-        (epoch_losses, num_examples)
+        (epoch_losses, num_examples, total_steps)
+        total_steps нужен для вычисления c_i_new в SCAFFOLD.
     """
     model.to(device).train()
-    optimizer = torch.optim.SGD(
-        model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    # SCAFFOLD требует чистый SGD без momentum и без lr scheduler:
+    # формула c_i_new = (x - y_i) / (K * lr) выведена для plain SGD с постоянным lr.
+    # Momentum меняет эффективный шаг в (1/(1-β)) ≈ 10 раз → формула ломается → взрыв.
+    scaffold_mode = c_i is not None and c_server is not None
+    if scaffold_mode:
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=lr, momentum=0.0, weight_decay=weight_decay
+        )
+        scheduler = None
+    else:
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.CrossEntropyLoss()
     global_params = (
         [p.data.clone().to(device) for p in model.parameters()] if mu > 0.0 else None
     )
 
+    # SCAFFOLD: поправка к градиенту (c_server - c_i), переносим на device заранее
+    scaffold_corr: Optional[Dict[str, torch.Tensor]] = None
+    if scaffold_mode:
+        scaffold_corr = {
+            name: (c_server.get(name, torch.zeros_like(p.data))
+                   - c_i.get(name, torch.zeros_like(p.data))).to(device)
+            for name, p in model.named_parameters()
+            if p.requires_grad
+        }
+
     epoch_losses: List[float] = []
+    total_steps = 0
     for _ in range(epochs):
         loss_sum, batches = 0.0, 0
         for batch in loader:
@@ -108,13 +178,20 @@ def local_train(
                 )
                 loss = loss + (mu / 2) * prox
             loss.backward()
+            # Применяем SCAFFOLD поправку к градиентам
+            if scaffold_corr is not None:
+                for name, p in model.named_parameters():
+                    if p.grad is not None and name in scaffold_corr:
+                        p.grad.add_(scaffold_corr[name])
             optimizer.step()
             loss_sum += float(loss.item())
             batches += 1
+            total_steps += 1
         epoch_losses.append(loss_sum / max(batches, 1))
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
 
-    return epoch_losses, len(loader.dataset)
+    return epoch_losses, len(loader.dataset), total_steps
 
 
 @torch.no_grad()

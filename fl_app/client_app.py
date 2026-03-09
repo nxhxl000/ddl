@@ -8,9 +8,11 @@ import torch
 from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict
 from flwr.clientapp import ClientApp
 
+from datasets import load_from_disk
+
 from fl_app.models import build_model, get_hparams
 from fl_app.profiling import collect_data_profile, collect_hardware_info, run_benchmark
-from fl_app.training import get_device, local_train, make_dataloader
+from fl_app.training import get_device, local_train, make_dataloader, stratified_select
 
 app = ClientApp()
 
@@ -68,14 +70,60 @@ def train(msg: Message, context: Context) -> Message:
     except Exception:
         mu = 0.0
 
-    loader, img_col, label_col = make_dataloader(
-        partition_path, hp.batch_size, shuffle=True, num_workers=hp.num_workers, augment=True
-    )
+    # ── SCAFFOLD: загрузка c_server и c_i ─────────────────────────────────────
+    c_server_state = None
+    c_i_state      = None
+    if "c_server" in msg.content:
+        c_server_state = msg.content["c_server"].to_torch_state_dict()
+        # c_i хранится персистентно в context.state между раундами
+        if "c_client" in context.state:
+            c_i_state = context.state["c_client"].to_torch_state_dict()
+        else:
+            # Первый раунд — инициализируем нулями
+            c_i_state = {k: torch.zeros_like(v) for k, v in c_server_state.items()}
+
+    # ── Адаптивные параметры (из профилировочного раунда) ─────────────────────
+    cfg = msg.content["config"]
+    try:
+        adaptive_epochs = int(cfg[f"c{partition_id}_epochs"])
+        if adaptive_epochs > 0:
+            local_epochs = adaptive_epochs
+    except Exception:
+        pass
+
+    sample_budget = -1
+    try:
+        sample_budget = int(cfg[f"c{partition_id}_samples"])
+    except Exception:
+        pass
+
+    try:
+        server_round = int(cfg["server-round"])
+    except Exception:
+        server_round = 0
+
+    # ── Загрузка датасета (с опциональным стратифицированным чанкингом) ────────
+    if sample_budget > 0:
+        shuffle_seed = server_round * 100 + partition_id
+        ds = load_from_disk(str(partition_path))
+        lc = "label" if "label" in ds.features else "labels"
+        ds = stratified_select(ds, sample_budget, lc, seed=shuffle_seed)
+        loader, img_col, label_col = make_dataloader(
+            partition_path, hp.batch_size,
+            shuffle=True, num_workers=hp.num_workers, augment=True, dataset=ds,
+        )
+    else:
+        loader, img_col, label_col = make_dataloader(
+            partition_path, hp.batch_size, shuffle=True, num_workers=hp.num_workers, augment=True
+        )
+
+    # Снапшот весов до обучения (x — нужен для вычисления c_i_new в SCAFFOLD)
+    x0_state = {k: v.clone() for k, v in model.state_dict().items()} if c_server_state else None
 
     global_weights = [p.data.clone() for p in model.parameters()]
 
     t0 = time.perf_counter()
-    epoch_losses, num_examples = local_train(
+    epoch_losses, num_examples, total_steps = local_train(
         model, loader,
         device=device,
         epochs=local_epochs,
@@ -85,6 +133,8 @@ def train(msg: Message, context: Context) -> Message:
         img_col=img_col,
         label_col=label_col,
         mu=mu,
+        c_i=c_i_state,
+        c_server=c_server_state,
     )
     round_time = time.perf_counter() - t0
 
@@ -92,6 +142,28 @@ def train(msg: Message, context: Context) -> Message:
         (p.data.cpu() - wg).pow(2).sum()
         for p, wg in zip(model.parameters(), global_weights)
     )).item()
+
+    # ── SCAFFOLD: вычисление c_i_new и delta_c ────────────────────────────────
+    c_delta_arrays = None
+    if c_server_state is not None and x0_state is not None and total_steps > 0:
+        y_i_state = model.state_dict()
+        K, lr = total_steps, hp.lr
+        # Option I: c_i_new = c_i - c_server + (x - y_i) / (K * lr)
+        c_i_new_state = {
+            name: (
+                c_i_state[name]
+                - c_server_state[name]
+                + (x0_state[name].to(device) - y_i_state[name]) / (K * lr)
+            )
+            for name in c_i_state
+        }
+        # Сохраняем c_i_new для следующего раунда
+        context.state["c_client"] = ArrayRecord(c_i_new_state)
+        # delta_c = c_i_new - c_i отправляем на сервер
+        c_delta_arrays = ArrayRecord({
+            name: c_i_new_state[name] - c_i_state[name]
+            for name in c_i_state
+        })
 
     arrays  = ArrayRecord(model.state_dict())
     metrics = MetricRecord({
@@ -104,4 +176,7 @@ def train(msg: Message, context: Context) -> Message:
         "last-epoch-loss":  float(epoch_losses[-1]) if epoch_losses else 0.0,
         "drift":            float(drift),
     })
-    return Message(content=RecordDict({"arrays": arrays, "metrics": metrics}), reply_to=msg)
+    content = RecordDict({"arrays": arrays, "metrics": metrics})
+    if c_delta_arrays is not None:
+        content["c_delta"] = c_delta_arrays
+    return Message(content=content, reply_to=msg)

@@ -22,6 +22,7 @@ from fl_app.artifacts import (
     write_summary,
 )
 from fl_app.models import build_model, get_hparams
+from fl_app.adaptive import compute_adaptive_params, print_adaptive_summary, to_train_config_dict
 from fl_app.profiling import print_profiling_summary, run_profiling_round, save_cluster_profile
 from fl_app.strategies import build_strategy
 from fl_app.training import evaluate, get_device, make_dataloader
@@ -119,6 +120,9 @@ def main(grid: Grid, context: Context) -> None:
     # Запускается каждый раз — узлы и данные могут меняться между запусками.
     # Сохраняется в папку эксперимента (уникальную) как снапшот текущего запуска.
     profile_path = exp_dir / "cluster_profile.json"
+    profiles: dict = {}
+    adaptive_flat: dict = {}
+
     if enable_profiling:
         print("\nЗапуск профилировочного раунда...")
         profiles = run_profiling_round(
@@ -134,7 +138,13 @@ def main(grid: Grid, context: Context) -> None:
             num_classes=manifest["num_classes"],
         )
         print_profiling_summary(profiles)
-        print(f"  Профиль сохранён: {profile_path.name}\n")
+        print(f"  Профиль сохранён: {profile_path.name}")
+
+        # ── Адаптивное расписание (straggler mitigation) ──────────────────────
+        adaptive_params = compute_adaptive_params(profiles, base_epochs=local_epochs)
+        adaptive_flat   = to_train_config_dict(adaptive_params)
+        print_adaptive_summary(adaptive_params, profiles, base_epochs=local_epochs)
+        print()
 
     # ── Состояние FL-цикла ────────────────────────────────────────────────────
     run_start = time.time()
@@ -195,7 +205,7 @@ def main(grid: Grid, context: Context) -> None:
         grid=grid,
         initial_arrays=initial_arrays,
         num_rounds=num_rounds,
-        train_config=ConfigRecord({"learning-rate": hp.lr}),
+        train_config=ConfigRecord({"learning-rate": hp.lr, **adaptive_flat}),
         evaluate_fn=global_evaluate,
     )
 
