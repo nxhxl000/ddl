@@ -34,8 +34,14 @@ def make_exp_dir(
     agg_name: str,
     runs_dir: str = "runs",
 ) -> Tuple[Path, str]:
-    """Создать директорию эксперимента. Возвращает (path, exp_name)."""
-    exp_name = f"{partition_name}__{model_name}__{agg_name}"
+    """Создать директорию эксперимента. Возвращает (path, exp_name).
+
+    К имени добавляется уникальный 4-символьный hex-суффикс чтобы
+    несколько запусков одного эксперимента не перезаписывали друг друга.
+    """
+    import secrets
+    run_id = secrets.token_hex(2)          # 2 байта → 4 hex-символа, напр. "a3f2"
+    exp_name = f"{partition_name}__{model_name}__{agg_name}__{run_id}"
     exp_dir = Path(runs_dir) / exp_name
     exp_dir.mkdir(parents=True, exist_ok=True)
     return exp_dir, exp_name

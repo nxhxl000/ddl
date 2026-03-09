@@ -23,6 +23,7 @@ pyyaml
 pillow==11.2.1
 tqdm
 rich
+psutil
 
 # =========================
 # Dev
