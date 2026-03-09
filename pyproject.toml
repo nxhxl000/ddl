@@ -41,13 +41,15 @@ model               = "cifarcnn"    # cifarcnn | lenet5
 aggregation         = "fedprox"      # fedavg | fedprox | fedavgm | fedadam | fedyogi | fedadagrad | fedmedian | fedtrimmedavg | krum | multikrum | bulyan
 
 # FL infrastructure
-num-server-rounds   = 20
+num-server-rounds   = 3
 fraction-train      = 1.0
 min-train-nodes     = 6
 min-available-nodes = 6
 
 local-epochs = 3        # локальных эпох обучения на каждом клиенте за раунд
 data-dir     = "data/"
+
+enable-profiling = "true"   # профилировочный раунд перед обучением (false — отключить)
 
 [tool.flwr.federations]
 default = "yandex-cloud"

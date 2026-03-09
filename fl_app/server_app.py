@@ -22,6 +22,7 @@ from fl_app.artifacts import (
     write_summary,
 )
 from fl_app.models import build_model, get_hparams
+from fl_app.profiling import print_profiling_summary, run_profiling_round, save_cluster_profile
 from fl_app.strategies import build_strategy
 from fl_app.training import evaluate, get_device, make_dataloader
 
@@ -42,6 +43,7 @@ def main(grid: Grid, context: Context) -> None:
     min_available_nodes: int  = int(rc.get("min-available-nodes", 1))
     local_epochs:       int   = int(rc.get("local-epochs", 5))
     data_dir:           str   = rc.get("data-dir", "data/")
+    enable_profiling:   bool  = str(rc.get("enable-profiling", "true")).lower() != "false"
 
     # ── Manifest — метаданные партиции ────────────────────────────────────────
     part_dir = Path(data_dir) / "partitions" / partition_name
@@ -112,6 +114,27 @@ def main(grid: Grid, context: Context) -> None:
 
     write_log_header(log_path, config=config, model=global_model, device=device)
     init_csvs(rounds_csv, clients_csv, classes_csv)
+
+    # ── Профилировочный раунд (до основного обучения) ─────────────────────────
+    # Запускается каждый раз — узлы и данные могут меняться между запусками.
+    # Сохраняется в папку эксперимента (уникальную) как снапшот текущего запуска.
+    profile_path = exp_dir / "cluster_profile.json"
+    if enable_profiling:
+        print("\nЗапуск профилировочного раунда...")
+        profiles = run_profiling_round(
+            grid=grid,
+            initial_arrays=initial_arrays,
+            fraction_train=fraction_train,
+            min_train_nodes=min_train_nodes,
+            min_available_nodes=min_available_nodes,
+        )
+        save_cluster_profile(
+            profiles, exp_dir,
+            partition_name=partition_name,
+            num_classes=manifest["num_classes"],
+        )
+        print_profiling_summary(profiles)
+        print(f"  Профиль сохранён: {profile_path.name}\n")
 
     # ── Состояние FL-цикла ────────────────────────────────────────────────────
     run_start = time.time()
@@ -202,5 +225,7 @@ def main(grid: Grid, context: Context) -> None:
     print(f"  {clients_csv.name}")
     print(f"  {classes_csv.name}")
     print(f"  {summary_path.name}")
+    if enable_profiling:
+        print(f"  {profile_path.name}")
     for p in plots:
         print(f"  {p.name}")

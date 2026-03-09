@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import time
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict
 from flwr.clientapp import ClientApp
 
 from fl_app.models import build_model, get_hparams
+from fl_app.profiling import collect_data_profile, collect_hardware_info, run_benchmark
 from fl_app.training import get_device, local_train, make_dataloader
 
 app = ClientApp()
@@ -24,25 +26,52 @@ def train(msg: Message, context: Context) -> Message:
     partition_id = int(context.node_config.get("partition-id", 0))
     partition_path = Path(data_dir) / "partitions" / partition_name / f"client_{partition_id}"
 
-    # Гиперпараметры из реестра моделей
-    hp = get_hparams(model_name)
-
     # Загружаем веса от сервера
     model = build_model(model_name)
     model.load_state_dict(msg.content["arrays"].to_torch_state_dict())
+    device = get_device()
 
-    # FedProx mu (приходит от сервера если стратегия = fedprox, иначе 0)
+    # ── Профилировочный раунд ─────────────────────────────────────────────────
+    try:
+        is_profiling = float(msg.content["config"]["profiling-mode"]) == 1.0
+    except Exception:
+        is_profiling = False
+
+    if is_profiling:
+        benchmark_samples = int(msg.content["config"].get("benchmark-samples", 1000.0))
+        benchmark_epochs  = int(msg.content["config"].get("benchmark-epochs",  2.0))
+
+        hw      = collect_hardware_info()
+        data    = collect_data_profile(partition_path)
+        bench   = run_benchmark(
+            copy.deepcopy(model), partition_path, device,
+            max_samples=benchmark_samples,
+            epochs=benchmark_epochs,
+        )
+
+        metrics = MetricRecord({
+            "partition-id": float(partition_id),
+            "num-examples": float(benchmark_samples),
+            **hw,
+            **data,
+            **bench,
+        })
+        # Возвращаем оригинальные веса без изменений
+        arrays = ArrayRecord(model.state_dict())
+        return Message(content=RecordDict({"arrays": arrays, "metrics": metrics}), reply_to=msg)
+
+    # ── Обычный тренировочный раунд ───────────────────────────────────────────
+    hp = get_hparams(model_name)
+
     try:
         mu = float(msg.content["config"]["proximal-mu"])
     except Exception:
         mu = 0.0
 
-    device = get_device()
     loader, img_col, label_col = make_dataloader(
         partition_path, hp.batch_size, shuffle=True, num_workers=hp.num_workers, augment=True
     )
 
-    # Сохраняем глобальные веса до обучения — для вычисления drift
     global_weights = [p.data.clone() for p in model.parameters()]
 
     t0 = time.perf_counter()
@@ -59,7 +88,6 @@ def train(msg: Message, context: Context) -> Message:
     )
     round_time = time.perf_counter() - t0
 
-    # Client drift: ||w_local - w_global||_F
     drift = torch.sqrt(sum(
         (p.data.cpu() - wg).pow(2).sum()
         for p, wg in zip(model.parameters(), global_weights)
