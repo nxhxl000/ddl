@@ -22,7 +22,7 @@ from fl_app.artifacts import (
     write_summary,
 )
 from fl_app.models import build_model, get_hparams
-from fl_app.adaptive import compute_adaptive_params, print_adaptive_summary, to_train_config_dict
+from fl_app.adaptive import compute_adaptive_params, make_adaptive_log, print_adaptive_summary, to_train_config_dict
 from fl_app.profiling import print_profiling_summary, run_profiling_round, save_cluster_profile
 from fl_app.strategies import build_strategy
 from fl_app.training import evaluate, get_device, make_dataloader
@@ -45,6 +45,7 @@ def main(grid: Grid, context: Context) -> None:
     local_epochs:       int   = int(rc.get("local-epochs", 5))
     data_dir:           str   = rc.get("data-dir", "data/")
     enable_profiling:   bool  = str(rc.get("enable-profiling", "true")).lower() != "false"
+    adaptive_mode:      str   = str(rc.get("adaptive-mode", "maximize-epochs"))
 
     # ── Manifest — метаданные партиции ────────────────────────────────────────
     part_dir = Path(data_dir) / "partitions" / partition_name
@@ -101,6 +102,9 @@ def main(grid: Grid, context: Context) -> None:
         "num_workers":  hp.num_workers,
         # strategy params (из strategies.py)
         **{f"strategy_{k}": v for k, v in strategy_params.items()},
+        # adaptive
+        "enable_profiling": enable_profiling,
+        "adaptive_mode":    adaptive_mode if enable_profiling else "disabled",
     }
 
     # ── Директория и файлы эксперимента ──────────────────────────────────────
@@ -137,13 +141,19 @@ def main(grid: Grid, context: Context) -> None:
             partition_name=partition_name,
             num_classes=manifest["num_classes"],
         )
-        print_profiling_summary(profiles)
+        print_profiling_summary(profiles, num_classes=manifest["num_classes"])
         print(f"  Профиль сохранён: {profile_path.name}")
 
         # ── Адаптивное расписание (straggler mitigation) ──────────────────────
-        adaptive_params = compute_adaptive_params(profiles, base_epochs=local_epochs)
+        adaptive_params = compute_adaptive_params(profiles, base_epochs=local_epochs, mode=adaptive_mode)
         adaptive_flat   = to_train_config_dict(adaptive_params)
-        print_adaptive_summary(adaptive_params, profiles, base_epochs=local_epochs)
+        print_adaptive_summary(adaptive_params, profiles, base_epochs=local_epochs, mode=adaptive_mode, tolerance=0.10)
+
+        # Дописываем расписание в cluster_profile.json
+        adaptive_log = make_adaptive_log(adaptive_params, profiles, local_epochs, adaptive_mode, tolerance=0.10)
+        profile_data = json.loads(profile_path.read_text())
+        profile_data["adaptive_schedule"] = adaptive_log
+        profile_path.write_text(json.dumps(profile_data, indent=2, ensure_ascii=False))
         print()
 
     # ── Состояние FL-цикла ────────────────────────────────────────────────────
@@ -151,6 +161,7 @@ def main(grid: Grid, context: Context) -> None:
     cum_comm_mb = 0.0
     prev_acc = 0.0
     all_round_accs: List[Tuple[int, float]] = []
+    all_round_f1s:  List[Tuple[int, float]] = []
 
     # ── Callback оценки после каждого раунда ─────────────────────────────────
     def global_evaluate(server_round: int, arrays: ArrayRecord) -> MetricRecord:
@@ -159,7 +170,7 @@ def main(grid: Grid, context: Context) -> None:
         eval_start = time.time()
         model = build_model(model_name)
         model.load_state_dict(arrays.to_torch_state_dict())
-        loss, acc, per_class = evaluate(
+        loss, acc, per_class, f1 = evaluate(
             model, testloader, device=device, img_col=img_col, label_col=label_col
         )
         eval_time = time.time() - eval_start
@@ -176,10 +187,10 @@ def main(grid: Grid, context: Context) -> None:
         )
 
         log_round(log_path, server_round=server_round, client_logs=client_logs,
-                  test_acc=acc, test_loss=loss,
+                  test_acc=acc, test_f1=f1, test_loss=loss,
                   train_time=train_time, agg_time=agg_time, eval_time=eval_time)
         cum_comm_mb = append_rounds_row(
-            rounds_csv, server_round=server_round, acc=acc, delta_acc=delta_acc,
+            rounds_csv, server_round=server_round, acc=acc, f1=f1, delta_acc=delta_acc,
             loss=loss, client_logs=client_logs, model_bytes=model_bytes,
             train_time_sec=train_time, agg_time_sec=agg_time, eval_time_sec=eval_time,
             cum_comm_mb=cum_comm_mb,
@@ -190,15 +201,16 @@ def main(grid: Grid, context: Context) -> None:
             per_class=per_class, class_names=manifest["class_names"],
         )
         all_round_accs.append((server_round, acc))
+        all_round_f1s.append((server_round, f1))
 
         if server_round == num_rounds:
             write_summary(
                 summary_path, exp_name=exp_name, all_round_accs=all_round_accs,
-                total_wall_time=time.time() - run_start,
+                all_round_f1s=all_round_f1s, total_wall_time=time.time() - run_start,
                 cum_comm_mb=cum_comm_mb, config=config,
             )
 
-        return MetricRecord({"test_loss": float(loss), "test_acc": float(acc)})
+        return MetricRecord({"test_loss": float(loss), "test_acc": float(acc), "test_f1": float(f1)})
 
     # ── Запуск FL ─────────────────────────────────────────────────────────────
     result = strategy.start(
@@ -237,5 +249,5 @@ def main(grid: Grid, context: Context) -> None:
     print(f"  {summary_path.name}")
     if enable_profiling:
         print(f"  {profile_path.name}")
-    for p in plots:
+    for p in sorted(plots, key=lambda x: x.name):
         print(f"  {p.name}")
