@@ -202,16 +202,19 @@ def evaluate(
     device: torch.device,
     img_col: str,
     label_col: str,
-) -> Tuple[float, float, Dict[int, Tuple[int, int]]]:
+) -> Tuple[float, float, Dict[int, Tuple[int, int]], float]:
     """Серверная оценка модели.
 
     Returns:
-        (loss, accuracy, per_class) где per_class = {class_id: (correct, total)}
+        (loss, accuracy, per_class, f1_macro)
+        per_class = {class_id: (correct, total)}
+        f1_macro  = macro-averaged F1 score across all classes
     """
     model.to(device).eval()
     criterion = nn.CrossEntropyLoss()
     total_loss, batches, correct, total = 0.0, 0, 0, 0
-    per_class: Dict[int, List[int]] = {}  # {class_id: [correct, total]}
+    per_class: Dict[int, List[int]] = {}   # {class_id: [correct, total]}
+    pred_counts: Dict[int, int] = {}       # {class_id: n_predicted} — needed for precision
 
     for batch in loader:
         x      = batch[img_col].to(device)
@@ -231,8 +234,19 @@ def evaluate(
             per_class[true_cls][1] += 1
             if true_cls == pred_cls:
                 per_class[true_cls][0] += 1
+            pred_counts[pred_cls] = pred_counts.get(pred_cls, 0) + 1
+
+    # Macro F1: average per-class F1 over all true classes
+    f1_scores = []
+    for cls, (tp, n_true) in per_class.items():
+        n_pred    = pred_counts.get(cls, 0)
+        precision = tp / n_pred  if n_pred  > 0 else 0.0
+        recall    = tp / n_true  if n_true  > 0 else 0.0
+        denom     = precision + recall
+        f1_scores.append(2 * precision * recall / denom if denom > 0 else 0.0)
+    f1_macro = sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
 
     per_class_result: Dict[int, Tuple[int, int]] = {
         cls: (counts[0], counts[1]) for cls, counts in per_class.items()
     }
-    return total_loss / max(batches, 1), correct / max(total, 1), per_class_result
+    return total_loss / max(batches, 1), correct / max(total, 1), per_class_result, f1_macro

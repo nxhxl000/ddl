@@ -13,9 +13,10 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -28,6 +29,57 @@ try:
     _PSUTIL = True
 except ImportError:
     _PSUTIL = False
+
+
+# ── Метрики гетерогенности ────────────────────────────────────────────────────
+
+def _entropy_norm(dist: Dict[int, int], num_classes: int) -> float:
+    """Нормализованная энтропия Шеннона локального распределения классов.
+
+    Учитывает все num_classes классов (включая отсутствующие с вероятностью 0).
+    Возвращает значение в [0, 1]: 1 = равномерное (IID), 0 = один класс.
+    """
+    n = sum(dist.values())
+    if n == 0 or num_classes <= 1:
+        return 0.0
+    entropy = -sum(
+        (dist.get(c, 0) / n) * math.log(dist.get(c, 0) / n)
+        for c in range(num_classes)
+        if dist.get(c, 0) > 0
+    )
+    return round(entropy / math.log(num_classes), 4)
+
+
+def _js_divergence(dist_a: Dict[int, int], dist_b: Dict[int, int], num_classes: int) -> float:
+    """Jensen-Shannon дивергенция между двумя распределениями классов (счётчики).
+
+    Возвращает значение в [0, 1]: 0 = одинаковые, 1 = максимально разные.
+    """
+    n_a = sum(dist_a.values())
+    n_b = sum(dist_b.values())
+    if n_a == 0 or n_b == 0:
+        return 1.0
+    p = {c: dist_a.get(c, 0) / n_a for c in range(num_classes)}
+    q = {c: dist_b.get(c, 0) / n_b for c in range(num_classes)}
+    m = {c: (p[c] + q[c]) / 2 for c in range(num_classes)}
+
+    def _kl(a: Dict[int, float]) -> float:
+        return sum(a[c] * math.log(a[c] / m[c]) for c in range(num_classes) if a[c] > 0)
+
+    return round(0.5 * _kl(p) + 0.5 * _kl(q), 4)
+
+
+def _mean_pairwise_js(dists: List[Dict[int, int]], num_classes: int) -> float:
+    """Среднее попарное JS-расстояние между всеми парами клиентов."""
+    n = len(dists)
+    if n < 2:
+        return 0.0
+    values = [
+        _js_divergence(dists[i], dists[j], num_classes)
+        for i in range(n)
+        for j in range(i + 1, n)
+    ]
+    return round(sum(values) / len(values), 4)
 
 
 # ── Клиентские утилиты ────────────────────────────────────────────────────────
@@ -171,15 +223,17 @@ class ProfilingStrategy(FedAvg):
     def aggregate_train(
         self, server_round: int, replies: Iterable[Message]
     ) -> Tuple[Optional[ArrayRecord], Optional[MetricRecord]]:
-        replies_list = list(replies)
-        for rep in replies_list:
+        for rep in replies:
             if not rep.has_content() or "metrics" not in rep.content:
                 continue
             m: MetricRecord = rep.content["metrics"]  # type: ignore[assignment]
             cid = int(m.get("partition-id", float(rep.metadata.src_node_id)))
             # Сохраняем все float-поля MetricRecord
             self._client_profiles[cid] = dict(m)
-        return super().aggregate_train(server_round, replies_list)
+        # Не вызываем super() — агрегация весов не нужна, а FedAvg проверяет
+        # одинаковость ключей MetricRecord, что ломается при вырожденных классах
+        # (data_cls_N отсутствует у клиентов без этого класса).
+        return ArrayRecord({}), MetricRecord({})
 
     def get_profiles(self) -> Dict[int, Dict[str, float]]:
         return dict(self._client_profiles)
@@ -265,39 +319,79 @@ def save_cluster_profile(
             scalars["missing_classes"] = sorted(
                 c for c in range(num_classes) if c not in class_dist
             )
+            # Per-client: нормализованная энтропия (1=IID, 0=один класс)
+            scalars["entropy_norm"] = _entropy_norm(class_dist, num_classes)
 
         enriched["clients"][str(cid)] = scalars
+
+    # System-level: среднее попарное JS-расстояние между клиентами
+    all_dists = [
+        enriched["clients"][str(cid)].get("class_distribution", {})
+        for cid in sorted(profiles.keys())
+    ]
+    enriched["mean_pairwise_js"] = _mean_pairwise_js(all_dists, num_classes)
 
     out_path = exp_dir / "cluster_profile.json"
     out_path.write_text(json.dumps(enriched, indent=2))
     return out_path
 
 
-def print_profiling_summary(profiles: Dict[int, Dict[str, float]]) -> None:
-    """Печатает таблицу профилей клиентов в терминал."""
+def print_profiling_summary(
+    profiles: Dict[int, Dict[str, float]],
+    *,
+    num_classes: int = 0,
+) -> None:
+    """Печатает таблицу профилей клиентов в терминал.
+
+    num_classes: передаётся для вычисления entropy_norm и mean_pairwise_js.
+    """
     width = 78
     print("=" * width)
     print(f"  Профилирование кластера: {len(profiles)} клиентов")
     print("=" * width)
-    header = f"  {'ID':>3}  {'CPU':>4}  {'RAM':>6}  {'Сэмплы':>8}  {'Неравн.':>8}  {'Вырожд.':>8}  {'Скорость':>10}  {'Loss':>7}"
+    header = (
+        f"  {'ID':>3}  {'CPU':>4}  {'RAM':>6}  {'Сэмплы':>8}"
+        f"  {'Неравн.':>8}  {'Вырожд.':>8}  {'Скорость':>10}  {'Loss':>7}"
+    )
+    if num_classes > 1:
+        header += f"  {'Энтропия':>9}"
     print(header)
     print("-" * width)
 
+    all_dists: List[Dict[int, int]] = []
     for cid in sorted(profiles):
-        m = profiles[cid]
-        cpu  = int(m.get("hw_cpu_logical", 0))
-        ram  = m.get("hw_ram_total_gb", 0.0)
-        n    = int(m.get("data_num_samples", 0))
-        imb  = m.get("data_imbalance_ratio", 0.0)
-        deg  = int(m.get("data_n_degenerate", 0))
-        sps  = m.get("bench_samples_per_sec", 0.0)
+        m   = profiles[cid]
+        cpu = int(m.get("hw_cpu_logical", 0))
+        ram = m.get("hw_ram_total_gb", 0.0)
+        n   = int(m.get("data_num_samples", 0))
+        imb = m.get("data_imbalance_ratio", 0.0)
+        deg = int(m.get("data_n_degenerate", 0))
+        sps = m.get("bench_samples_per_sec", 0.0)
         loss = m.get("bench_final_loss", 0.0)
 
         deg_str = f"{deg} (!)" if deg > 0 else "0"
-        print(
+        line = (
             f"  {cid:>3}  {cpu:>4}  {ram:>5.1f}G"
             f"  {n:>8}  {imb:>7.1f}x  {deg_str:>8}"
             f"  {sps:>8.0f}/s  {loss:>7.4f}"
         )
 
+        if num_classes > 1:
+            class_dist = {
+                int(k.split("data_cls_")[1]): int(v)
+                for k, v in m.items()
+                if k.startswith("data_cls_")
+            }
+            ent = _entropy_norm(class_dist, num_classes)
+            line += f"  {ent:>9.4f}"
+            all_dists.append(class_dist)
+
+        print(line)
+
     print("=" * width)
+
+    if num_classes > 1 and len(all_dists) >= 2:
+        mpjs = _mean_pairwise_js(all_dists, num_classes)
+        print(f"  Межклиентская гетерогенность (mean pairwise JS): {mpjs:.4f}"
+              f"  {'(близко к IID)' if mpjs < 0.05 else '(умеренная)' if mpjs < 0.20 else '(высокая)'}")
+        print("=" * width)

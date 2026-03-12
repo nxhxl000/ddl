@@ -92,7 +92,7 @@ def write_log_header(
 def init_csvs(rounds_path: Path, clients_path: Path, classes_path: Path) -> None:
     with rounds_path.open("w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([
-            "round", "test_acc", "delta_acc", "test_loss", "n_clients",
+            "round", "test_acc", "test_f1", "delta_acc", "test_loss", "n_clients",
             "comm_down_mb", "comm_up_mb", "cum_comm_mb",
             "train_time_sec", "agg_time_sec", "eval_time_sec", "round_total_time_sec",
             "max_client_time_sec", "mean_client_time_sec",
@@ -118,6 +118,7 @@ def log_round(
     server_round: int,
     client_logs: Dict[int, Dict[str, Any]],
     test_acc: float,
+    test_f1: float = 0.0,
     test_loss: float,
     train_time: float = 0.0,
     agg_time: float = 0.0,
@@ -137,7 +138,7 @@ def log_round(
             f.write(f"    train time       : {p['round_time_sec']:.2f}s  ({sec_per_1k:.2f}s/1k examples)\n")
         f.write(f"  Timing: train={train_time:.1f}s  agg={agg_time:.2f}s  eval={eval_time:.2f}s"
                 f"  total={train_time + agg_time + eval_time:.1f}s\n")
-        f.write(f"  Server eval: acc={test_acc:.4f}  loss={test_loss:.6f}\n\n")
+        f.write(f"  Server eval: acc={test_acc:.4f}  f1={test_f1:.4f}  loss={test_loss:.6f}\n\n")
 
 
 def append_rounds_row(
@@ -145,6 +146,7 @@ def append_rounds_row(
     *,
     server_round: int,
     acc: float,
+    f1: float = 0.0,
     delta_acc: float,
     loss: float,
     client_logs: Dict[int, Dict[str, Any]],
@@ -181,7 +183,7 @@ def append_rounds_row(
     with rounds_path.open("a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([
             server_round,
-            f"{acc:.6f}", f"{delta_acc:+.6f}", f"{loss:.6f}", n,
+            f"{acc:.6f}", f"{f1:.6f}", f"{delta_acc:+.6f}", f"{loss:.6f}", n,
             f"{comm_each:.4f}", f"{comm_each:.4f}", f"{cum_comm_mb:.4f}",
             f"{train_time_sec:.2f}", f"{agg_time_sec:.2f}",
             f"{eval_time_sec:.2f}", f"{round_total:.2f}",
@@ -263,43 +265,49 @@ def generate_plots(
     df_cl = pd.read_csv(classes_csv)
     saved: List[Path] = []
 
-    # ── 1. Accuracy + Loss (line) ─────────────────────────────────────────────
+    has_f1 = "test_f1" in df_r.columns
+
+    def _line_plot(metric_col: str, ylabel: str, color: str, title: str, out_path: Path) -> None:
+        fig, ax1 = plt.subplots(figsize=(10, 5))
+        ax1.plot(df_r["round"], df_r[metric_col] * 100,
+                 color=color, linewidth=2, marker="o", markersize=5, label=ylabel)
+        ax1.set_xlabel("Round", fontsize=12)
+        ax1.set_ylabel(f"{ylabel} (%)", color=color, fontsize=12)
+        ax1.tick_params(axis="y", labelcolor=color)
+        ax1.set_ylim(bottom=0)
+
+        best_idx = df_r[metric_col].idxmax()
+        best_r   = int(df_r.loc[best_idx, "round"])
+        best_v   = float(df_r.loc[best_idx, metric_col]) * 100
+        ax1.scatter(best_r, best_v, color="gold", s=200, zorder=6,
+                    marker="*", label=f"Best: {best_v:.1f}% (r{best_r})")
+
+        ax2 = ax1.twinx()
+        ax2.plot(df_r["round"], df_r["test_loss"],
+                 color="tomato", linewidth=1.5, linestyle="--", alpha=0.8, label="Test Loss")
+        ax2.set_ylabel("Loss", color="tomato", fontsize=12)
+        ax2.tick_params(axis="y", labelcolor="tomato")
+
+        lines  = ax1.get_legend_handles_labels()
+        lines2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines[0] + lines2[0], lines[1] + lines2[1], loc="lower right", fontsize=10)
+        ax1.set_title(f"{title} — {exp_name}", fontsize=13, pad=10)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+    # ── 1. Accuracy + Loss ────────────────────────────────────────────────────
     acc_path = Path(f"{out_prefix}__accuracy.png")
-    fig, ax1 = plt.subplots(figsize=(10, 5))
-
-    color_acc  = "steelblue"
-    color_loss = "tomato"
-
-    ax1.plot(df_r["round"], df_r["test_acc"] * 100,
-             color=color_acc, linewidth=2, marker="o", markersize=5, label="Test Accuracy")
-    ax1.set_xlabel("Round", fontsize=12)
-    ax1.set_ylabel("Accuracy (%)", color=color_acc, fontsize=12)
-    ax1.tick_params(axis="y", labelcolor=color_acc)
-    ax1.set_ylim(bottom=0)
-
-    # Лучший раунд
-    best_idx = df_r["test_acc"].idxmax()
-    best_r   = int(df_r.loc[best_idx, "round"])
-    best_acc = float(df_r.loc[best_idx, "test_acc"]) * 100
-    ax1.scatter(best_r, best_acc, color="gold", s=200, zorder=6,
-                marker="*", label=f"Best: {best_acc:.1f}% (r{best_r})")
-
-    ax2 = ax1.twinx()
-    ax2.plot(df_r["round"], df_r["test_loss"],
-             color=color_loss, linewidth=1.5, linestyle="--", alpha=0.8, label="Test Loss")
-    ax2.set_ylabel("Loss", color=color_loss, fontsize=12)
-    ax2.tick_params(axis="y", labelcolor=color_loss)
-
-    lines  = ax1.get_legend_handles_labels()
-    lines2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines[0] + lines2[0], lines[1] + lines2[1], loc="lower right", fontsize=10)
-    ax1.set_title(f"Server Accuracy & Loss — {exp_name}", fontsize=13, pad=10)
-    fig.tight_layout()
-    fig.savefig(acc_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    _line_plot("test_acc", "Test Accuracy", "steelblue", "Server Accuracy & Loss", acc_path)
     saved.append(acc_path)
 
-    # ── 2. Train Loss Boxplot (per round) ─────────────────────────────────────
+    # ── 2. F1 + Loss ──────────────────────────────────────────────────────────
+    if has_f1:
+        f1_path = Path(f"{out_prefix}__f1.png")
+        _line_plot("test_f1", "Macro F1", "seagreen", "Server F1 & Loss", f1_path)
+        saved.append(f1_path)
+
+    # ── 3. Train Loss Boxplot (per round) ─────────────────────────────────────
     box_path = Path(f"{out_prefix}__train_loss_boxplot.png")
     rounds   = sorted(df_c["round"].unique())
     data     = [df_c[df_c["round"] == r]["train_loss_last"].dropna().values for r in rounds]
@@ -335,7 +343,7 @@ def generate_plots(
     plt.close(fig)
     saved.append(box_path)
 
-    # ── 3. Per-Class Accuracy Heatmap ─────────────────────────────────────────
+    # ── 4. Per-Class Accuracy Heatmap ─────────────────────────────────────────
     if not df_cl.empty and len(class_names) > 0:
         heat_path = Path(f"{out_prefix}__class_accuracy.png")
 
@@ -393,9 +401,12 @@ def print_summary_table(
     if df.empty:
         return
 
-    sep   = "─" * 74
-    hsep  = "═" * 74
-    hdr   = f"{'Round':>5}  {'Acc':>8}  {'Δ Acc':>8}  {'Loss':>8}  {'MeanDrift':>10}  {'RoundTime':>10}"
+    has_f1 = "test_f1" in df.columns
+
+    sep   = "─" * (74 + (10 if has_f1 else 0))
+    hsep  = "═" * (74 + (10 if has_f1 else 0))
+    hdr   = f"{'Round':>5}  {'Acc':>8}  " + (f"{'F1':>8}  " if has_f1 else "") + \
+            f"{'Δ Acc':>8}  {'Loss':>8}  {'MeanDrift':>10}  {'RoundTime':>10}"
 
     print(f"\n{hsep}")
     print(f"  {exp_name}")
@@ -406,22 +417,29 @@ def print_summary_table(
     for _, row in df.iterrows():
         r      = int(row["round"])
         acc    = float(row["test_acc"]) * 100
+        f1     = float(row["test_f1"]) * 100 if has_f1 else None
         delta  = float(row["delta_acc"]) * 100
         loss   = float(row["test_loss"])
         drift  = float(row.get("mean_drift", 0.0))
         rtime  = float(row.get("round_total_time_sec", 0.0))
+        f1_str = f"  {f1:>7.2f}%" if f1 is not None else ""
         print(
-            f"  {r:>3}    {acc:>7.2f}%  {delta:>+8.2f}%  {loss:>8.4f}"
+            f"  {r:>3}    {acc:>7.2f}%{f1_str}  {delta:>+8.2f}%  {loss:>8.4f}"
             f"  {drift:>10.4f}  {rtime:>8.1f}s"
         )
 
     best_row = df.loc[df["test_acc"].idxmax()]
     best_acc = float(best_row["test_acc"]) * 100
     best_r   = int(best_row["round"])
+    best_f1_str = ""
+    if has_f1:
+        best_f1_row = df.loc[df["test_f1"].idxmax()]
+        best_f1_str = f"  │  Best F1: {float(best_f1_row['test_f1'])*100:.2f}% @ r{int(best_f1_row['round'])}"
 
     print(sep)
     print(
-        f"  Best: {best_acc:.2f}% @ round {best_r}"
+        f"  Best Acc: {best_acc:.2f}% @ round {best_r}"
+        f"{best_f1_str}"
         f"  │  Comm: {cum_comm_mb:.1f} MB"
         f"  │  Time: {total_wall_time:.0f}s"
     )
@@ -433,11 +451,13 @@ def write_summary(
     *,
     exp_name: str,
     all_round_accs: List[Tuple[int, float]],
+    all_round_f1s: List[Tuple[int, float]],
     total_wall_time: float,
     cum_comm_mb: float,
     config: Dict[str, Any],
 ) -> None:
     best_round, best_acc = max(all_round_accs, key=lambda x: x[1])
+    best_f1_round, best_f1 = max(all_round_f1s, key=lambda x: x[1]) if all_round_f1s else (0, 0.0)
 
     def rounds_to(target: float) -> Optional[int]:
         return next((r for r, a in all_round_accs if a >= target), None)
@@ -446,6 +466,8 @@ def write_summary(
         "exp_name":            exp_name,
         "best_test_acc":       float(best_acc),
         "best_round":          int(best_round),
+        "best_test_f1":        float(best_f1),
+        "best_f1_round":       int(best_f1_round),
         "rounds_to_80pct":     rounds_to(0.80),
         "rounds_to_90pct":     rounds_to(0.90),
         "rounds_to_95pct":     rounds_to(0.95),
