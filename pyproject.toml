@@ -49,8 +49,8 @@ aggregation = "fedavg"       # fedavg | fedprox | ... | scaffold
 # FL infrastructure
 num-server-rounds   = 3
 fraction-train      = 1.0
-min-train-nodes     = 5
-min-available-nodes = 5
+min-train-nodes     = 1
+min-available-nodes = 1
 
 local-epochs = 3        # локальных эпох обучения на каждом клиенте за раунд
 data-dir     = "data/"
