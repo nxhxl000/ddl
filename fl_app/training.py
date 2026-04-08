@@ -68,6 +68,29 @@ def _infer_columns(ds) -> Tuple[str, str]:
     return img_col, label_col
 
 
+class _TensorDataset(torch.utils.data.Dataset):
+    """Предобработанный датасет: PIL→Tensor один раз, потом из памяти."""
+
+    def __init__(self, images: torch.Tensor, labels: torch.Tensor, augment: bool = False):
+        self.images = images    # (N, C, H, W) float32
+        self.labels = labels    # (N,) long
+        self.augment = augment
+        if augment:
+            from torchvision.transforms import RandomCrop, RandomHorizontalFlip
+            self.crop = RandomCrop(images.shape[-1], padding=4)
+            self.flip = RandomHorizontalFlip()
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        img = self.images[idx]
+        if self.augment:
+            img = self.crop(img)
+            img = self.flip(img)
+        return img, self.labels[idx]
+
+
 def make_dataloader(
     partition_path: Path | str,
     batch_size: int,
@@ -79,30 +102,24 @@ def make_dataloader(
 ) -> Tuple[DataLoader, str, str]:
     """Загрузить партицию с диска и вернуть DataLoader + имена колонок.
 
-    augment=True: для RGB-изображений добавляет RandomCrop(32, padding=4)
-    и RandomHorizontalFlip перед ToTensor. Для grayscale — только ToTensor.
+    Конвертирует PIL→Tensor один раз при загрузке (кеш в памяти).
+    Аугментация (RandomCrop, RandomHorizontalFlip) применяется на лету к тензорам.
 
-    dataset: опционально передать уже загруженный HF Dataset (напр., после shuffle+select).
+    dataset: опционально передать уже загруженный HF Dataset.
              Если задан, partition_path игнорируется.
     """
-    from torchvision.transforms import Compose, RandomCrop, RandomHorizontalFlip, ToTensor
+    from torchvision.transforms.functional import to_tensor
 
     ds = dataset if dataset is not None else load_from_disk(str(partition_path))
     img_col, label_col = _infer_columns(ds)
 
-    # Определяем transform один раз по первому изображению
-    if augment and getattr(ds[0][img_col], "mode", None) == "RGB":
-        transform = Compose([RandomCrop(32, padding=4), RandomHorizontalFlip(), ToTensor()])
-    else:
-        transform = ToTensor()
+    # Конвертируем все PIL→Tensor один раз
+    images = torch.stack([to_tensor(x) for x in ds[img_col]])
+    labels = torch.tensor(ds[label_col], dtype=torch.long)
 
-    def apply_transform(batch):
-        batch[img_col] = [transform(x) for x in batch[img_col]]
-        return batch
-
-    ds = ds.with_transform(apply_transform)
+    tensor_ds = _TensorDataset(images, labels, augment=augment)
     loader = DataLoader(
-        ds,
+        tensor_ds,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
@@ -171,9 +188,9 @@ def local_train(
     total_steps = 0
     for _ in range(epochs):
         loss_sum, batches = 0.0, 0
-        for batch in loader:
-            x = batch[img_col].to(device)
-            y = batch[label_col].to(device)
+        for x, y in loader:
+            x = x.to(device)
+            y = y.to(device)
             optimizer.zero_grad(set_to_none=True)
             loss = criterion(model(x), y)
             if global_params is not None:
@@ -221,9 +238,9 @@ def evaluate(
     per_class: Dict[int, List[int]] = {}   # {class_id: [correct, total]}
     pred_counts: Dict[int, int] = {}       # {class_id: n_predicted} — needed for precision
 
-    for batch in loader:
-        x      = batch[img_col].to(device)
-        y      = batch[label_col].to(device)
+    for x, y in loader:
+        x      = x.to(device)
+        y      = y.to(device)
         logits = model(x)
 
         total_loss += float(criterion(logits, y).item())
