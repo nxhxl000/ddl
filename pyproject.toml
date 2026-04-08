@@ -43,7 +43,7 @@ data-mode = "research"
 # Research mode: имя партиции (игнорируется в production)
 partition-name = "cifar100__iid__n5__s42"
 
-model       = "wrn_28_4"     # из MODEL_REGISTRY
+model       = "simple_cnn"   # simple_cnn (тест) | wrn_28_4
 aggregation = "fedavg"       # fedavg | fedprox | ... | scaffold
 
 # FL infrastructure

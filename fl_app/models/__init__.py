@@ -27,6 +27,7 @@ class ModelConfig:
 
 
 from fl_app.models.cifar100 import WideResNet
+from fl_app.models.cifar100.simple_cnn import SimpleCNN
 
 # ── Per-model hyperparameters ─────────────────────────────────────────────────
 #
@@ -43,11 +44,24 @@ _WRN_28_4_HPARAMS = TrainHParams(
     num_workers=0,
 )
 
+_SIMPLE_CNN_HPARAMS = TrainHParams(
+    lr=0.01,
+    batch_size=64,
+    momentum=0.9,
+    weight_decay=1e-4,
+    num_workers=0,
+)
+
 MODEL_REGISTRY: Dict[str, ModelConfig] = {
     "wrn_28_4": ModelConfig(
         cls=WideResNet,
         kwargs={"depth": 28, "widen": 4, "num_classes": 100, "drop_rate": 0.3},
         hparams=_WRN_28_4_HPARAMS,
+    ),
+    "simple_cnn": ModelConfig(
+        cls=SimpleCNN,
+        kwargs={"num_classes": 100, "drop_rate": 0.25},
+        hparams=_SIMPLE_CNN_HPARAMS,
     ),
 }
 

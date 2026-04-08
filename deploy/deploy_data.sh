@@ -59,6 +59,9 @@ fi
 HAS_SERVER_DS=false
 [[ -d "$LOCAL_DIR/server" ]] && HAS_SERVER_DS=true
 
+# Относительный путь на удалённой машине (от $HOME)
+REMOTE_PART="$REMOTE_DIR/data/partitions/$PARTITION_NAME"
+
 echo "============================================"
 echo "  Деплой партиции: $PARTITION_NAME"
 echo "  Клиентов в партиции: $NUM_CLIENTS"
@@ -73,14 +76,11 @@ if [[ "$NUM_CLIENTS" -gt "$NUM_NODES" ]]; then
     exit 1
 fi
 
-REMOTE_PART_DIR="$REMOTE_DIR/data/partitions/$PARTITION_NAME"
-
 # ── Сервер ────────────────────────────────────────────────────────────────────
 echo "--- [server] ${SERVER_HOST}:${SERVER_PORT} ---"
 
-# Проверяем наличие данных на сервере
 server_has_data=false
-if ssh_server "test -f $REMOTE_PART_DIR/manifest.json" 2>/dev/null; then
+if ssh_server "test -f \$HOME/$REMOTE_PART/manifest.json" 2>/dev/null; then
     server_has_data=true
 fi
 
@@ -88,15 +88,15 @@ if $server_has_data && ! $FORCE; then
     ok "Данные уже есть, пропускаем"
 else
     log "Создаю директорию..."
-    ssh_server "mkdir -p $REMOTE_PART_DIR"
+    ssh_server "mkdir -p \$HOME/$REMOTE_PART"
 
     log "Загружаю test/ и manifest.json..."
-    scp_to_server "$LOCAL_DIR/manifest.json" "$REMOTE_PART_DIR/manifest.json"
-    scp_to_server "$LOCAL_DIR/test/" "$REMOTE_PART_DIR/"
+    scp_to_server "$LOCAL_DIR/manifest.json" "$REMOTE_PART/manifest.json"
+    scp_to_server "$LOCAL_DIR/test/" "$REMOTE_PART/"
 
     if $HAS_SERVER_DS; then
         log "Загружаю server/..."
-        scp_to_server "$LOCAL_DIR/server/" "$REMOTE_PART_DIR/"
+        scp_to_server "$LOCAL_DIR/server/" "$REMOTE_PART/"
     fi
 
     ok "Сервер готов"
@@ -110,9 +110,8 @@ for ((i=0; i<NUM_CLIENTS; i++)); do
     port="${NODE_PORTS[$i]}"
     echo "--- [$name] $host:$port → client_$i ---"
 
-    # Проверяем наличие данных
     node_has_data=false
-    if ssh_node "$i" "test -f $REMOTE_PART_DIR/manifest.json" 2>/dev/null; then
+    if ssh_node "$i" "test -f \$HOME/$REMOTE_PART/manifest.json" 2>/dev/null; then
         node_has_data=true
     fi
 
@@ -123,9 +122,8 @@ for ((i=0; i<NUM_CLIENTS; i++)); do
     fi
 
     log "Создаю директорию..."
-    ssh_node "$i" "mkdir -p $REMOTE_PART_DIR"
+    ssh_node "$i" "mkdir -p \$HOME/$REMOTE_PART"
 
-    # Загружаем только партицию этого клиента
     client_dir="$LOCAL_DIR/client_$i"
     if [[ ! -d "$client_dir" ]]; then
         fail "Локальная директория не найдена: $client_dir"
@@ -134,14 +132,13 @@ for ((i=0; i<NUM_CLIENTS; i++)); do
     fi
 
     log "Загружаю client_$i/..."
-    scp_to_node "$i" "$client_dir/" "$REMOTE_PART_DIR/"
+    scp_to_node "$i" "$client_dir/" "$REMOTE_PART/"
 
-    # manifest.json нужен клиенту? Нет, но пригодится для проверки
-    scp_to_node "$i" "$LOCAL_DIR/manifest.json" "$REMOTE_PART_DIR/manifest.json"
+    scp_to_node "$i" "$LOCAL_DIR/manifest.json" "$REMOTE_PART/manifest.json"
 
     if $HAS_SERVER_DS; then
         log "Загружаю server/..."
-        scp_to_node "$i" "$LOCAL_DIR/server/" "$REMOTE_PART_DIR/"
+        scp_to_node "$i" "$LOCAL_DIR/server/" "$REMOTE_PART/"
     fi
 
     ok "$name готов"

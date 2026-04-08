@@ -82,11 +82,26 @@ fi
 echo ""
 
 # ── 4. Запуск клиентов ────────────────────────────────────────────────────────
+# Клиенты в той же сети что сервер подключаются напрямую.
+# Остальные (YC) — через SSH-туннель (порт 9092 не открыт извне).
 log "Запускаю клиентов..."
 for ((i=0; i<NUM_CLIENTS; i++)); do
     name="${NODE_NAMES[$i]}"
-    log "  [$name] partition-id=$i"
-    ssh_node "$i" "tmux new-session -d -s client 'cd ~/ddl && source .venv/bin/activate && ddl-client start --server ${SERVER_HOST}:${FLOWER_FLEET_PORT} --partition-id $i 2>&1 | tee /tmp/client.log'"
+    node_key="${NODE_KEYS[$i]}"
+    server_key_expanded="$(_expand_key "$SERVER_KEY")"
+    node_key_expanded="$(_expand_key "$node_key")"
+
+    if [[ "$node_key_expanded" == "$server_key_expanded" ]]; then
+        # Та же сеть — прямое подключение
+        log "  [$name] partition-id=$i (direct)"
+        ssh_node "$i" "tmux new-session -d -s client 'cd ~/ddl && source .venv/bin/activate && ddl-client start --server ${SERVER_HOST}:${FLOWER_FLEET_PORT} --partition-id $i 2>&1 | tee /tmp/client.log'"
+    else
+        # Другая сеть — SSH-туннель
+        log "  [$name] partition-id=$i (tunnel)"
+        ssh_node "$i" "tmux new-session -d -s client 'ssh -i ~/.ssh/server_tunnel_key -p ${SERVER_PORT} -L 9092:localhost:9092 -N -o StrictHostKeyChecking=no -o ServerAliveInterval=15 ${SERVER_USER}@${SERVER_HOST} &
+sleep 2
+cd ~/ddl && source .venv/bin/activate && ddl-client start --server localhost:${FLOWER_FLEET_PORT} --partition-id $i 2>&1 | tee /tmp/client.log'"
+    fi
 done
 
 # Ждём подключения клиентов

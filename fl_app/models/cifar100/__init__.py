@@ -9,6 +9,7 @@ from .wrn          import WideResNet
 from .efficientnet import build_efficientnet_b0
 from .cct          import CCT
 from .se_resnet    import CifarSEResNet
+from .simple_cnn   import SimpleCNN
 
 # Дефолтные гиперпараметры обучения для каждой модели.
 # Взяты из оригинальных статей / best practices для CIFAR-100 scratch.
@@ -55,6 +56,16 @@ MODEL_CONFIGS: dict = {
         drop_rate    = 0.3,
         description  = "CifarSEResNet (PreActResNet + SE), ~4.5M params, 76.1% CIFAR-100, FL-friendly",
     ),
+    "simple_cnn": dict(
+        optimizer    = "sgd",
+        lr           = 0.01,
+        momentum     = 0.9,
+        weight_decay = 1e-4,
+        scheduler    = "cosine",
+        epochs       = 60,
+        batch_size   = 64,
+        description  = "SimpleCNN, ~210K params, быстрый тест на CPU",
+    ),
     "cct_7_3x1": dict(
         optimizer    = "adamw",
         lr           = 5e-4,
@@ -96,6 +107,9 @@ def build_model(name: str, num_classes: int = 100, **kwargs) -> "torch.nn.Module
             drop_rate=kwargs.get("drop_rate", 0.2),
             drop_path_rate=kwargs.get("drop_path_rate", 0.2),
         )
+    elif name == "simple_cnn":
+        return SimpleCNN(num_classes=num_classes,
+                         drop_rate=kwargs.get("drop_rate", 0.25))
     elif name == "cct_7_3x1":
         return CCT(num_classes=num_classes, **kwargs)
     else:
