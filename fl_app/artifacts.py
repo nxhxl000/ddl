@@ -99,6 +99,7 @@ def init_csvs(rounds_path: Path, clients_path: Path, classes_path: Path) -> None
             "min_client_time_sec", "std_client_time_sec",
             "mean_train_loss", "std_train_loss",
             "mean_drift", "max_drift",
+            "effective_js",
         ])
     with clients_path.open("w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([
@@ -123,6 +124,7 @@ def log_round(
     train_time: float = 0.0,
     agg_time: float = 0.0,
     eval_time: float = 0.0,
+    effective_js: float = 0.0,
 ) -> None:
     with log_path.open("a", encoding="utf-8") as f:
         f.write(f"Round {server_round}:\n")
@@ -138,7 +140,8 @@ def log_round(
             f.write(f"    train time       : {p['round_time_sec']:.2f}s  ({sec_per_1k:.2f}s/1k examples)\n")
         f.write(f"  Timing: train={train_time:.1f}s  agg={agg_time:.2f}s  eval={eval_time:.2f}s"
                 f"  total={train_time + agg_time + eval_time:.1f}s\n")
-        f.write(f"  Server eval: acc={test_acc:.4f}  f1={test_f1:.4f}  loss={test_loss:.6f}\n\n")
+        js_str = f"  effective_js={effective_js:.4f}" if effective_js > 0.0 else ""
+        f.write(f"  Server eval: acc={test_acc:.4f}  f1={test_f1:.4f}  loss={test_loss:.6f}{js_str}\n\n")
 
 
 def append_rounds_row(
@@ -155,6 +158,7 @@ def append_rounds_row(
     agg_time_sec: float,
     eval_time_sec: float,
     cum_comm_mb: float,
+    effective_js: float = 0.0,
 ) -> float:
     """Добавить строку в rounds.csv. Возвращает обновлённый cum_comm_mb."""
     n = len(client_logs)
@@ -190,6 +194,7 @@ def append_rounds_row(
             f"{max_t:.2f}", f"{mean_t:.2f}", f"{min_t:.2f}", f"{std_t:.2f}",
             f"{mean_loss:.6f}", f"{std_loss:.6f}",
             f"{mean_drift:.6f}", f"{max_drift:.6f}",
+            f"{effective_js:.6f}",
         ])
     return cum_comm_mb
 

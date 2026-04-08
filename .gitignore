@@ -39,10 +39,6 @@ data/
 runs/
 outputs/
 results/
-logs/
-reports/
-models/
-local_exp/
 
 # Model checkpoints
 *.pt
@@ -66,3 +62,4 @@ Thumbs.db
 # Claude Code
 # =========================
 CLAUDE.md
+.claude/

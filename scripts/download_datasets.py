@@ -1,11 +1,9 @@
 """
-Скачивает датасеты (CIFAR-10, CIFAR-100, MNIST, PlantVillage) и сохраняет локально в папку data/
+Скачивает датасеты (CIFAR-100, PlantVillage) и сохраняет локально в папку data/
 Запуск:
   python scripts/download_datasets.py
   python scripts/download_datasets.py --data-dir data
-  python scripts/download_datasets.py --only cifar10
   python scripts/download_datasets.py --only cifar100
-  python scripts/download_datasets.py --only mnist
   python scripts/download_datasets.py --only plantvillage
   python scripts/download_datasets.py --force
 """
@@ -123,34 +121,26 @@ def main() -> int:
     parser.add_argument("--data-dir", default="data", help="Куда сохранять датасеты (по умолчанию: data/)")
     parser.add_argument(
         "--only",
-        choices=["cifar10", "cifar100", "mnist", "plantvillage", "all"],
+        choices=["cifar100", "plantvillage", "all"],
         default="all",
-        help="Какой датасет скачать: cifar10 | cifar100 | mnist | plantvillage | all (по умолчанию: all)",
+        help="Какой датасет скачать: cifar100 | plantvillage | all (по умолчанию: all)",
     )
     parser.add_argument("--force", action="store_true", help="Перескачать/пересохранить, удалив старую папку")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
 
-    if args.only in ("all", "cifar10"):
-        download_and_save("cifar10", data_dir / "cifar10", force=args.force)
-
     if args.only in ("all", "cifar100"):
         download_and_save("cifar100", data_dir / "cifar100", force=args.force)
-
-    if args.only in ("all", "mnist"):
-        download_and_save("mnist", data_dir / "mnist", force=args.force)
 
     if args.only in ("all", "plantvillage"):
         download_plantvillage_kaggle(data_dir / "plantvillage", force=args.force)
 
-    requested = args.only if args.only != "all" else "cifar10, mnist, plantvillage"
+    requested = args.only if args.only != "all" else "cifar100, plantvillage"
     print("All requested datasets are ready.")
     print(f"Requested: {requested}")
     paths = {
-        "cifar10":      data_dir / "cifar10",
         "cifar100":     data_dir / "cifar100",
-        "mnist":        data_dir / "mnist",
         "plantvillage": data_dir / "plantvillage",
     }
     for name, path in paths.items():

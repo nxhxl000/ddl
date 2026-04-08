@@ -74,8 +74,8 @@ def make_dataloader(
 ) -> Tuple[DataLoader, str, str]:
     """Загрузить партицию с диска и вернуть DataLoader + имена колонок.
 
-    augment=True: для RGB-изображений (CIFAR-10) добавляет RandomCrop(32, padding=4)
-    и RandomHorizontalFlip перед ToTensor. Для grayscale (MNIST) — только ToTensor.
+    augment=True: для RGB-изображений добавляет RandomCrop(32, padding=4)
+    и RandomHorizontalFlip перед ToTensor. Для grayscale — только ToTensor.
 
     dataset: опционально передать уже загруженный HF Dataset (напр., после shuffle+select).
              Если задан, partition_path игнорируется.

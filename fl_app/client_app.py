@@ -12,6 +12,7 @@ from datasets import load_from_disk
 
 from fl_app.models import build_model, get_hparams
 from fl_app.profiling import collect_data_profile, collect_hardware_info, run_benchmark
+from fl_app.server_data import sample_server_dataset
 from fl_app.training import get_device, local_train, make_dataloader, stratified_select
 
 app = ClientApp()
@@ -108,6 +109,36 @@ def train(msg: Message, context: Context) -> Message:
         ds = load_from_disk(str(partition_path))
         lc = "label" if "label" in ds.features else "labels"
         ds = stratified_select(ds, sample_budget, lc, seed=shuffle_seed)
+    else:
+        ds = None  # make_dataloader загрузит с диска сам
+
+    # ── Серверный датасет (опционально) ───────────────────────────────────────
+    # Ключи c{pid}_srv_{k} присутствуют только если server-budget > 0
+    num_classes = max(
+        (int(k.split("_srv_")[1]) for k in cfg if k.startswith(f"c{partition_id}_srv_")),
+        default=-1,
+    ) + 1
+    server_ds = None
+    if num_classes > 0:
+        server_path = Path(data_dir) / "partitions" / partition_name / "server"
+        if server_path.exists():
+            class_counts = [
+                int(cfg.get(f"c{partition_id}_srv_{k}", 0.0))
+                for k in range(num_classes)
+            ]
+            round_seed = server_round * 997
+            server_ds = sample_server_dataset(server_path, class_counts, round_seed)
+
+    # ── Объединяем локальные + серверные данные ────────────────────────────────
+    if server_ds is not None and len(server_ds) > 0:
+        from datasets import concatenate_datasets
+        local_ds = ds if ds is not None else load_from_disk(str(partition_path))
+        combined_ds = concatenate_datasets([local_ds, server_ds])
+        loader, img_col, label_col = make_dataloader(
+            partition_path, hp.batch_size,
+            shuffle=True, num_workers=hp.num_workers, augment=True, dataset=combined_ds,
+        )
+    elif ds is not None:
         loader, img_col, label_col = make_dataloader(
             partition_path, hp.batch_size,
             shuffle=True, num_workers=hp.num_workers, augment=True, dataset=ds,

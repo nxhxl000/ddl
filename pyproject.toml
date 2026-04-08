@@ -36,7 +36,7 @@ clientapp = "fl_app.client_app:app"
 # Параметры стратегии   → fl_app/strategies.py
 # -----------------------------------------------------
 [tool.flwr.app.config]
-partition-name      = "cifar10__dirichlet__a0.2__m0__n6__s42"
+partition-name      = "cifar10__dirichlet__a0.2__m0__n6__s42__srv10000"
 model               = "cifarcnn"    # cifarcnn | lenet5
 aggregation         = "fedavg"     # fedavg | fedprox | fedavgm | fedadam | fedyogi | fedadagrad | fedmedian | fedtrimmedavg | krum | multikrum | bulyan
 
@@ -50,7 +50,9 @@ local-epochs = 3        # локальных эпох обучения на ка
 data-dir     = "data/"
 
 enable-profiling = "true"   # профилировочный раунд перед обучением (false — отключить)
-adaptive-mode    = "maximize-chunk"  # maximize-epochs | maximize-chunk
+adaptive-mode    = "maximize-epochs"  # maximize-epochs | maximize-chunk
+
+server-mode   = "shared"  # disabled | shared | exclusive
 
 [tool.flwr.federations]
 default = "yandex-cloud"

@@ -9,14 +9,17 @@ scripts/partition_utils.py — логика разбивки датасета м
      - dirichlet: пропорционально выборке из Dir(alpha)
 
 Публичный API:
+  extract_server_dataset(dataset, server_size, *, seed, label_col)
+      -> tuple[Dataset, Dataset]   # (server_ds, remaining_ds)
+
   partition_dataset(dataset, num_clients, scheme, *, alpha, min_per_class, seed, label_col)
       -> list[Dataset]
 
   save_partitions(ds_dict, partitions, out_dir, *, dataset, scheme, alpha,
-                  min_per_class, seed, label_col, force)
+                  min_per_class, seed, label_col, server_dataset, force)
       -> Path
 
-  partition_dir_name(dataset, scheme, num_clients, seed) -> str
+  partition_dir_name(dataset, scheme, num_clients, seed, *, server_size) -> str
 
   load_manifest(out_dir) -> dict
 """
@@ -109,6 +112,66 @@ def _dirichlet_split(
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
+def extract_server_dataset(
+    dataset: Dataset,
+    server_size: int,
+    *,
+    seed: int = 42,
+    label_col: str = "label",
+) -> tuple[Dataset, Dataset]:
+    """Выделяет сбалансированный серверный датасет из тренировочных данных.
+
+    Стратифицированная выборка: floor(server_size / num_classes) образцов на класс.
+    Остаток (dataset минус серверный датасет) возвращается для разбивки между клиентами.
+
+    Args:
+        dataset:     Полный тренировочный датасет.
+        server_size: Количество образцов для серверного датасета.
+                     Должно быть >= num_classes.
+        seed:        Seed для воспроизводимости.
+        label_col:   Имя столбца с метками.
+
+    Returns:
+        (server_dataset, remaining_dataset)
+    """
+    rng = np.random.default_rng(seed)
+    labels = np.array(dataset[label_col])
+    classes = sorted(set(labels.tolist()))
+    num_classes = len(classes)
+
+    per_class = server_size // num_classes
+    if per_class == 0:
+        raise ValueError(
+            f"server_size={server_size} слишком мало для {num_classes} классов "
+            f"(нужно минимум {num_classes})"
+        )
+
+    server_indices: list[int] = []
+    remaining_indices: list[int] = []
+
+    for cls in classes:
+        cls_idx = np.where(labels == cls)[0]
+        rng.shuffle(cls_idx)
+        if len(cls_idx) < per_class:
+            raise ValueError(
+                f"Класс {cls} содержит только {len(cls_idx)} образцов, "
+                f"необходимо {per_class} для серверного датасета"
+            )
+        server_indices.extend(cls_idx[:per_class].tolist())
+        remaining_indices.extend(cls_idx[per_class:].tolist())
+
+    actual_size = per_class * num_classes  # может быть меньше server_size на остаток деления
+    if actual_size != server_size:
+        print(
+            f"[partition] server_size={server_size} не делится на {num_classes} классов — "
+            f"фактический размер: {actual_size} ({per_class}/класс)"
+        )
+
+    server_ds = dataset.select(sorted(server_indices))
+    remaining_ds = dataset.select(sorted(remaining_indices))
+    return server_ds, remaining_ds
+
+
 def partition_dataset(
     dataset: Dataset,
     num_clients: int,
@@ -175,6 +238,7 @@ def save_partitions(
     min_per_class: int,
     seed: int,
     label_col: str = "label",
+    server_dataset: "Dataset | None" = None,
     force: bool = False,
 ) -> Path:
     """Сохраняет партиции и тест-сплит на диск, записывает manifest.json.
@@ -206,6 +270,10 @@ def save_partitions(
             return out_dir
 
     out_dir.mkdir(parents=True)
+
+    if server_dataset is not None:
+        server_dataset.save_to_disk(str(out_dir / "server"))
+        print(f"  server:   {len(server_dataset):,} samples (сбалансированный)")
 
     for i, part in enumerate(partitions):
         part.save_to_disk(str(out_dir / f"client_{i}"))
@@ -245,6 +313,7 @@ def save_partitions(
         "class_names":   class_names,
         "clients":       client_stats,
         "test_size":     len(ds_dict["test"]) if "test" in ds_dict else None,
+        "server_size":   len(server_dataset) if server_dataset is not None else None,
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
@@ -260,12 +329,14 @@ def partition_dir_name(
     *,
     alpha: float | None = None,
     min_per_class: int = 0,
+    server_size: int = 0,
 ) -> str:
     """Генерирует стандартное имя директории партиций.
 
     Примеры:
-        "cifar10__iid__n5__s42"
-        "cifar10__dirichlet__a0.5__m50__n5__s42"
+        "cifar100__iid__n6__s42"
+        "cifar100__dirichlet__a0.5__m50__n6__s42"
+        "cifar100__dirichlet__a0.5__m50__n6__s42__srv10000"
     """
     parts = [dataset, scheme]
     if scheme == "dirichlet":
@@ -273,6 +344,8 @@ def partition_dir_name(
         parts.append(f"m{min_per_class}")
     parts.append(f"n{num_clients}")
     parts.append(f"s{seed}")
+    if server_size > 0:
+        parts.append(f"srv{server_size}")
     return "__".join(parts)
 
 

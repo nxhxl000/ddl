@@ -24,6 +24,10 @@ from fl_app.artifacts import (
 from fl_app.models import build_model, get_hparams
 from fl_app.adaptive import compute_adaptive_params, make_adaptive_log, print_adaptive_summary, to_train_config_dict
 from fl_app.profiling import print_profiling_summary, run_profiling_round, save_cluster_profile
+from fl_app.server_data import (
+    compute_effective_js, compute_server_schedule,
+    make_server_log, print_server_schedule_summary, to_server_config_dict,
+)
 from fl_app.strategies import build_strategy
 from fl_app.training import evaluate, get_device, make_dataloader
 
@@ -46,6 +50,7 @@ def main(grid: Grid, context: Context) -> None:
     data_dir:           str   = rc.get("data-dir", "data/")
     enable_profiling:   bool  = str(rc.get("enable-profiling", "true")).lower() != "false"
     adaptive_mode:      str   = str(rc.get("adaptive-mode", "maximize-epochs"))
+    server_mode:        str   = str(rc.get("server-mode", "disabled"))
 
     # ── Manifest — метаданные партиции ────────────────────────────────────────
     part_dir = Path(data_dir) / "partitions" / partition_name
@@ -105,6 +110,8 @@ def main(grid: Grid, context: Context) -> None:
         # adaptive
         "enable_profiling": enable_profiling,
         "adaptive_mode":    adaptive_mode if enable_profiling else "disabled",
+        # server dataset
+        "server_mode": server_mode,
     }
 
     # ── Директория и файлы эксперимента ──────────────────────────────────────
@@ -123,9 +130,11 @@ def main(grid: Grid, context: Context) -> None:
     # ── Профилировочный раунд (до основного обучения) ─────────────────────────
     # Запускается каждый раз — узлы и данные могут меняться между запусками.
     # Сохраняется в папку эксперимента (уникальную) как снапшот текущего запуска.
-    profile_path = exp_dir / "cluster_profile.json"
-    profiles: dict = {}
-    adaptive_flat: dict = {}
+    profile_path    = exp_dir / "cluster_profile.json"
+    profiles:       dict = {}
+    adaptive_flat:  dict = {}
+    server_schedule: dict = {}   # {partition_id: [count_k, ...]}  — empty = disabled
+    effective_js:   float = 0.0  # mean_pairwise_js после добавления серверных данных
 
     if enable_profiling:
         print("\nЗапуск профилировочного раунда...")
@@ -149,10 +158,47 @@ def main(grid: Grid, context: Context) -> None:
         adaptive_flat   = to_train_config_dict(adaptive_params)
         print_adaptive_summary(adaptive_params, profiles, base_epochs=local_epochs, mode=adaptive_mode, tolerance=0.10)
 
-        # Дописываем расписание в cluster_profile.json
+        # Дописываем адаптивное расписание в cluster_profile.json
         adaptive_log = make_adaptive_log(adaptive_params, profiles, local_epochs, adaptive_mode, tolerance=0.10)
         profile_data = json.loads(profile_path.read_text())
         profile_data["adaptive_schedule"] = adaptive_log
+
+        # ── Серверный датасет (если режим не disabled и server/ существует) ────
+        server_dir  = part_dir / "server"
+        server_size = manifest.get("server_size")
+        if server_mode != "disabled" and server_size and server_dir.exists():
+            print("\nВычисление расписания серверного датасета...")
+            server_schedule = compute_server_schedule(
+                profiles,
+                num_classes=manifest["num_classes"],
+                server_size=server_size,
+                mode=server_mode,
+            )
+            js_before = profile_data.get("mean_pairwise_js", 0.0)
+            effective_js = compute_effective_js(
+                server_schedule, profiles, manifest["num_classes"]
+            )
+            print_server_schedule_summary(
+                server_schedule, profiles,
+                num_classes=manifest["num_classes"],
+                server_size=server_size,
+                mode=server_mode,
+                class_names=manifest["class_names"],
+                mean_pairwise_js_before=js_before,
+            )
+            profile_data["server_schedule"] = make_server_log(
+                server_schedule, profiles,
+                num_classes=manifest["num_classes"],
+                server_size=server_size,
+                mode=server_mode,
+                mean_pairwise_js_before=js_before,
+            )
+        elif server_mode != "disabled":
+            if not server_size:
+                print("\n[server-data] server-mode задан, но партиция не содержит server/ (server_size=None в manifest). Пропускаем.")
+            elif not server_dir.exists():
+                print(f"\n[server-data] server-mode задан, но {server_dir} не найден. Пропускаем.")
+
         profile_path.write_text(json.dumps(profile_data, indent=2, ensure_ascii=False))
         print()
 
@@ -188,12 +234,13 @@ def main(grid: Grid, context: Context) -> None:
 
         log_round(log_path, server_round=server_round, client_logs=client_logs,
                   test_acc=acc, test_f1=f1, test_loss=loss,
-                  train_time=train_time, agg_time=agg_time, eval_time=eval_time)
+                  train_time=train_time, agg_time=agg_time, eval_time=eval_time,
+                  effective_js=effective_js)
         cum_comm_mb = append_rounds_row(
             rounds_csv, server_round=server_round, acc=acc, f1=f1, delta_acc=delta_acc,
             loss=loss, client_logs=client_logs, model_bytes=model_bytes,
             train_time_sec=train_time, agg_time_sec=agg_time, eval_time_sec=eval_time,
-            cum_comm_mb=cum_comm_mb,
+            cum_comm_mb=cum_comm_mb, effective_js=effective_js,
         )
         append_client_rows(clients_csv, server_round=server_round, client_logs=client_logs)
         append_classes_rows(
@@ -212,12 +259,20 @@ def main(grid: Grid, context: Context) -> None:
 
         return MetricRecord({"test_loss": float(loss), "test_acc": float(acc), "test_f1": float(f1)})
 
+    # ── Собираем статичный train_config ───────────────────────────────────────
+    # server_round_seed не нужен в ConfigRecord: клиент вычисляет из server-round * 997.
+    server_flat: dict = {}
+    if server_schedule:
+        for pid, counts in server_schedule.items():
+            for k, cnt in enumerate(counts):
+                server_flat[f"c{pid}_srv_{k}"] = float(cnt)
+
     # ── Запуск FL ─────────────────────────────────────────────────────────────
     result = strategy.start(
         grid=grid,
         initial_arrays=initial_arrays,
         num_rounds=num_rounds,
-        train_config=ConfigRecord({"learning-rate": hp.lr, **adaptive_flat}),
+        train_config=ConfigRecord({"learning-rate": hp.lr, **adaptive_flat, **server_flat}),
         evaluate_fn=global_evaluate,
     )
 
