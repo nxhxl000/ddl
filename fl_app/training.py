@@ -59,7 +59,12 @@ def _infer_columns(ds) -> Tuple[str, str]:
     img_col = next((c for c in ("img", "image", "pixel_values") if c in keys), None)
     if img_col is None:
         raise KeyError(f"Колонка с изображением не найдена. Доступные: {sorted(keys)}")
-    label_col = "label" if "label" in keys else "labels"
+    label_col = next(
+        (c for c in ("label", "labels", "fine_label", "coarse_label") if c in keys),
+        None,
+    )
+    if label_col is None:
+        raise KeyError(f"Колонка с меткой не найдена. Доступные: {sorted(keys)}")
     return img_col, label_col
 
 

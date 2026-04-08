@@ -4,6 +4,7 @@ import csv
 import json
 import math
 import platform
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -12,6 +13,31 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import flwr
 import torch
+
+
+# ── Environment info ─────────────────────────────────────────────────────────
+
+def _get_env_info() -> Dict[str, Any]:
+    """Собрать информацию об окружении для воспроизводимости."""
+    env = {
+        "python_version": sys.version.split()[0],
+        "torch_version":  torch.__version__,
+        "flwr_version":   flwr.__version__,
+        "platform":       platform.platform(),
+    }
+    try:
+        env["git_hash"] = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        env["git_dirty"] = bool(subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip())
+    except Exception:
+        env["git_hash"] = "unknown"
+        env["git_dirty"] = False
+    return env
 
 
 def _model_summary(model: torch.nn.Module) -> Dict[str, Any]:
@@ -28,24 +54,89 @@ def _model_summary(model: torch.nn.Module) -> Dict[str, Any]:
     }
 
 
+# ── Experiment directory ─────────────────────────────────────────────────────
+
+def _parse_partition_name(partition_name: str) -> Tuple[str, str]:
+    """Извлечь dataset и scheme-строку из имени партиции.
+
+    'cifar100__iid__n5__s42'                        → ('cifar100', 'iid__n5')
+    'cifar100__dirichlet__a0.3__m30__n5__s42'        → ('cifar100', 'dirichlet__a0.3__m30__n5')
+    'cifar100__dirichlet__a0.3__m30__n5__s42__srv1000' → ('cifar100', 'dirichlet__a0.3__m30__n5')
+    """
+    parts = partition_name.split("__")
+    dataset = parts[0]
+    scheme_parts = parts[1:]
+    # Убираем seed (sNN) и server size (srvNNN) с конца
+    while scheme_parts and (scheme_parts[-1].startswith("s") and scheme_parts[-1][1:].isdigit()
+                            or scheme_parts[-1].startswith("srv")):
+        scheme_parts.pop()
+    return dataset, "__".join(scheme_parts)
+
+
 def make_exp_dir(
     partition_name: str,
     model_name: str,
     agg_name: str,
-    runs_dir: str = "runs",
+    experiments_dir: str = "experiments",
 ) -> Tuple[Path, str]:
-    """Создать директорию эксперимента. Возвращает (path, exp_name).
+    """Создать директорию эксперимента с новой структурой.
 
-    К имени добавляется уникальный 4-символьный hex-суффикс чтобы
-    несколько запусков одного эксперимента не перезаписывали друг друга.
+    Структура:
+        experiments/{dataset}/{YYYYMMDD}__{scheme}__{model}__{agg}/{NNN}/
+            metrics/
+            plots/
+
+    Returns:
+        (exp_dir, exp_name) где exp_name = '{group_name}/{NNN}'
     """
-    import secrets
-    run_id = secrets.token_hex(2)          # 2 байта → 4 hex-символа, напр. "a3f2"
-    exp_name = f"{partition_name}__{model_name}__{agg_name}__{run_id}"
-    exp_dir = Path(runs_dir) / exp_name
-    exp_dir.mkdir(parents=True, exist_ok=True)
-    return exp_dir, exp_name
+    dataset, scheme_str = _parse_partition_name(partition_name)
+    date_str = datetime.now().strftime("%Y%m%d")
 
+    group_name = f"{date_str}__{scheme_str}__{model_name}__{agg_name}"
+    group_dir = Path(experiments_dir) / dataset / group_name
+
+    # Порядковый номер запуска
+    run_num = 1
+    if group_dir.exists():
+        existing = [d for d in group_dir.iterdir() if d.is_dir() and d.name.isdigit()]
+        if existing:
+            run_num = max(int(d.name) for d in existing) + 1
+
+    run_dir = group_dir / f"{run_num:03d}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "metrics").mkdir(exist_ok=True)
+    (run_dir / "plots").mkdir(exist_ok=True)
+
+    exp_name = f"{dataset}/{group_name}/{run_num:03d}"
+    return run_dir, exp_name
+
+
+# ── Config snapshot (пишется ДО обучения) ────────────────────────────────────
+
+def write_config(
+    config_path: Path,
+    *,
+    config: Dict[str, Any],
+    model: torch.nn.Module,
+    device: torch.device,
+) -> None:
+    """Записать полный снапшот конфига перед началом обучения."""
+    ms = _model_summary(model)
+    full = {
+        "timestamp":   datetime.now().isoformat(),
+        "environment": _get_env_info(),
+        "experiment":  config,
+        "model": {
+            "total_params":     ms["total_params"],
+            "trainable_params": ms["trainable_params"],
+            "size_mb":          round(ms["size_mb"], 3),
+        },
+        "device": str(device),
+    }
+    config_path.write_text(json.dumps(full, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ── Train log header ────────────────────────────────────────────────────────
 
 def write_log_header(
     log_path: Path,
@@ -55,22 +146,18 @@ def write_log_header(
     device: torch.device,
 ) -> None:
     ms = _model_summary(model)
-    try:
-        import torchvision
-        tv_ver = torchvision.__version__
-    except ImportError:
-        tv_ver = "not-installed"
+    env = _get_env_info()
 
     with log_path.open("w", encoding="utf-8") as f:
         f.write("Flower training log\n")
-        f.write(f"Start time  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write(f"Start time  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Git         : {env['git_hash']}{' (dirty)' if env.get('git_dirty') else ''}\n\n")
 
         f.write("== Environment ==\n")
-        f.write(f"python      : {sys.version.replace(chr(10), ' ')}\n")
-        f.write(f"platform    : {platform.platform()}\n")
-        f.write(f"flwr        : {flwr.__version__}\n")
-        f.write(f"torch       : {torch.__version__}\n")
-        f.write(f"torchvision : {tv_ver}\n")
+        f.write(f"python      : {env['python_version']}\n")
+        f.write(f"platform    : {env['platform']}\n")
+        f.write(f"flwr        : {env['flwr_version']}\n")
+        f.write(f"torch       : {env['torch_version']}\n")
         f.write(f"device      : {device}\n\n")
 
         f.write("== Experiment config ==\n")
@@ -89,10 +176,13 @@ def write_log_header(
         f.write("\n")
 
 
+# ── CSV init ─────────────────────────────────────────────────────────────────
+
 def init_csvs(rounds_path: Path, clients_path: Path, classes_path: Path) -> None:
     with rounds_path.open("w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([
-            "round", "test_acc", "test_f1", "delta_acc", "test_loss", "n_clients",
+            "round", "wall_clock_sec",
+            "test_acc", "test_f1", "delta_acc", "test_loss", "n_clients",
             "comm_down_mb", "comm_up_mb", "cum_comm_mb",
             "train_time_sec", "agg_time_sec", "eval_time_sec", "round_total_time_sec",
             "max_client_time_sec", "mean_client_time_sec",
@@ -112,6 +202,8 @@ def init_csvs(rounds_path: Path, clients_path: Path, classes_path: Path) -> None
             "round", "class_id", "class_name", "correct", "total", "accuracy",
         ])
 
+
+# ── Per-round logging ───────────────────────────────────────────────────────
 
 def log_round(
     log_path: Path,
@@ -148,6 +240,7 @@ def append_rounds_row(
     rounds_path: Path,
     *,
     server_round: int,
+    wall_clock_sec: float,
     acc: float,
     f1: float = 0.0,
     delta_acc: float,
@@ -187,6 +280,7 @@ def append_rounds_row(
     with rounds_path.open("a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([
             server_round,
+            f"{wall_clock_sec:.2f}",
             f"{acc:.6f}", f"{f1:.6f}", f"{delta_acc:+.6f}", f"{loss:.6f}", n,
             f"{comm_each:.4f}", f"{comm_each:.4f}", f"{cum_comm_mb:.4f}",
             f"{train_time_sec:.2f}", f"{agg_time_sec:.2f}",
@@ -240,15 +334,61 @@ def append_classes_rows(
             w.writerow([server_round, cls_id, name, correct, total, f"{acc:.6f}"])
 
 
+# ── Index (сводная таблица всех экспериментов) ───────────────────────────────
+
+def append_index_row(
+    experiments_dir: str,
+    *,
+    exp_name: str,
+    config: Dict[str, Any],
+    best_acc: float,
+    best_f1: float,
+    best_round: int,
+    num_rounds: int,
+    total_time: float,
+) -> None:
+    """Дописать строку в experiments/index.csv после завершения эксперимента."""
+    index_path = Path(experiments_dir) / "index.csv"
+    write_header = not index_path.exists()
+
+    with index_path.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow([
+                "date", "experiment", "dataset", "model", "aggregation",
+                "scheme", "alpha", "num_clients", "rounds",
+                "best_acc", "best_f1", "best_round",
+                "total_time_sec", "status",
+            ])
+        w.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M"),
+            exp_name,
+            config.get("dataset", ""),
+            config.get("model", ""),
+            config.get("aggregation", ""),
+            config.get("scheme", ""),
+            config.get("alpha", ""),
+            config.get("num_clients", ""),
+            num_rounds,
+            f"{best_acc:.6f}",
+            f"{best_f1:.6f}",
+            best_round,
+            f"{total_time:.1f}",
+            "completed",
+        ])
+
+
+# ── Plots ────────────────────────────────────────────────────────────────────
+
 def generate_plots(
     rounds_csv: Path,
     clients_csv: Path,
     classes_csv: Path,
-    out_prefix: Path,
+    plots_dir: Path,
     class_names: List[str],
     exp_name: str,
 ) -> List[Path]:
-    """Генерирует три графика и сохраняет их рядом с CSV-файлами.
+    """Генерирует графики и сохраняет в plots_dir.
 
     Returns:
         Список путей сохранённых PNG-файлов.
@@ -302,18 +442,18 @@ def generate_plots(
         plt.close(fig)
 
     # ── 1. Accuracy + Loss ────────────────────────────────────────────────────
-    acc_path = Path(f"{out_prefix}__accuracy.png")
+    acc_path = plots_dir / "accuracy.png"
     _line_plot("test_acc", "Test Accuracy", "steelblue", "Server Accuracy & Loss", acc_path)
     saved.append(acc_path)
 
     # ── 2. F1 + Loss ──────────────────────────────────────────────────────────
     if has_f1:
-        f1_path = Path(f"{out_prefix}__f1.png")
+        f1_path = plots_dir / "f1.png"
         _line_plot("test_f1", "Macro F1", "seagreen", "Server F1 & Loss", f1_path)
         saved.append(f1_path)
 
     # ── 3. Train Loss Boxplot (per round) ─────────────────────────────────────
-    box_path = Path(f"{out_prefix}__train_loss_boxplot.png")
+    box_path = plots_dir / "train_loss_boxplot.png"
     rounds   = sorted(df_c["round"].unique())
     data     = [df_c[df_c["round"] == r]["train_loss_last"].dropna().values for r in rounds]
     means    = [d.mean() if len(d) else 0.0 for d in data]
@@ -350,7 +490,7 @@ def generate_plots(
 
     # ── 4. Per-Class Accuracy Heatmap ─────────────────────────────────────────
     if not df_cl.empty and len(class_names) > 0:
-        heat_path = Path(f"{out_prefix}__class_accuracy.png")
+        heat_path = plots_dir / "class_accuracy.png"
 
         pivot = df_cl.pivot(index="class_name", columns="round", values="accuracy")
         ordered = [cn for cn in class_names if cn in pivot.index]
@@ -391,6 +531,8 @@ def generate_plots(
 
     return saved
 
+
+# ── Summary table (terminal) ────────────────────────────────────────────────
 
 def print_summary_table(
     rounds_csv: Path,
@@ -451,6 +593,8 @@ def print_summary_table(
     print(f"{hsep}\n")
 
 
+# ── Summary JSON ─────────────────────────────────────────────────────────────
+
 def write_summary(
     summary_path: Path,
     *,
@@ -478,6 +622,7 @@ def write_summary(
         "rounds_to_95pct":     rounds_to(0.95),
         "total_comm_mb":       float(cum_comm_mb),
         "total_wall_time_sec": float(total_wall_time),
+        "environment":         _get_env_info(),
         "config":              config,
     }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -5,51 +5,79 @@
 #   source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 # ==============================================================================
 
-# Загружаем конфиг узлов (nodes.conf лежит рядом с этим файлом)
 DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$DEPLOY_DIR/nodes.conf"
 
-# Строим массивы CLIENT_NAMES / CLIENT_IPS (внешние) / CLIENT_INT_IPS (внутренние)
-CLIENT_NAMES=()
-CLIENT_IPS=()
-CLIENT_INT_IPS=()
+# ── Построение массивов узлов ─────────────────────────────────────────────────
+NODE_NAMES=()
+NODE_HOSTS=()
+NODE_PORTS=()
+NODE_USERS=()
+NODE_KEYS=()
+
 _i=1
 while true; do
-  _v="CLIENT_$_i"; _ip="${!_v:-}"
-  [[ -z "$_ip" ]] && break
-  CLIENT_IPS+=("$_ip")
-  _vi="CLIENT_${_i}_INT";  CLIENT_INT_IPS+=("${!_vi:-$_ip}")
-  _vn="CLIENT_${_i}_NAME"; CLIENT_NAMES+=("${!_vn:-client-$_i}")
-  ((_i++))
+    _h="NODE_${_i}_HOST"
+    [[ -z "${!_h:-}" ]] && break
+    NODE_HOSTS+=("${!_h}")
+    _p="NODE_${_i}_PORT";  NODE_PORTS+=("${!_p:-22}")
+    _u="NODE_${_i}_USER";  NODE_USERS+=("${!_u:-$SERVER_USER}")
+    _k="NODE_${_i}_KEY";   NODE_KEYS+=("${!_k:-$SERVER_KEY}")
+    _n="NODE_${_i}_NAME";  NODE_NAMES+=("${!_n:-node-$_i}")
+    ((_i++))
 done
-unset _i _v _vi _vn _ip
+unset _i _h _p _u _k _n
 
-# SSH-ключ (WSL путь): копируем из Windows, если нужно
-SSH_KEY="$HOME/.ssh/admin-fl"
-if [[ ! -f "$SSH_KEY" ]] || ! diff -q "$SSH_KEY_WIN" "$SSH_KEY" &>/dev/null; then
-  mkdir -p "$HOME/.ssh"
-  cp "$SSH_KEY_WIN" "$SSH_KEY"
-  chmod 600 "$SSH_KEY"
-fi
+NUM_NODES=${#NODE_HOSTS[@]}
 
-# Базовые SSH-опции (без ProxyJump)
-SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
+# ── SSH-ключ: развернуть ~ в абсолютный путь ─────────────────────────────────
+_expand_key() {
+    local key="$1"
+    echo "${key/#\~/$HOME}"
+}
 
-# Подключение к серверу напрямую
+# ── SSH-функции ───────────────────────────────────────────────────────────────
+
+_ssh_opts() {
+    local key="$(_expand_key "$1")"
+    local port="${2:-22}"
+    echo "-i $key -p $port -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
+}
+
+# ssh_server "command"
 ssh_server() {
-  ssh $SSH_OPTS "$SSH_USER@$SERVER_EXT" "$@"
+    local opts; opts=$(_ssh_opts "$SERVER_KEY" "$SERVER_PORT")
+    ssh $opts "${SERVER_USER}@${SERVER_HOST}" "$@"
 }
 
-# Подключение к клиенту через сервер как jump host (внутренний IP).
-# Используем явный ProxyCommand — иначе OpenSSH не передаёт -i в jump-соединение.
-ssh_client() {
-  local int_ip="$1"; shift
-  ssh $SSH_OPTS \
-    -o "ProxyCommand=ssh $SSH_OPTS -W %h:%p $SSH_USER@$SERVER_EXT" \
-    "$SSH_USER@$int_ip" "$@"
+# ssh_node INDEX "command"   (INDEX 0-based)
+ssh_node() {
+    local idx="$1"; shift
+    local opts; opts=$(_ssh_opts "${NODE_KEYS[$idx]}" "${NODE_PORTS[$idx]}")
+    ssh $opts "${NODE_USERS[$idx]}@${NODE_HOSTS[$idx]}" "$@"
 }
 
-# Вспомогательные функции
+# scp_to_node INDEX local_path remote_path
+scp_to_node() {
+    local idx="$1"
+    local src="$2"
+    local dst="$3"
+    local key; key=$(_expand_key "${NODE_KEYS[$idx]}")
+    local port="${NODE_PORTS[$idx]}"
+    scp -i "$key" -P "$port" \
+        -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+        -r "$src" "${NODE_USERS[$idx]}@${NODE_HOSTS[$idx]}:$dst"
+}
+
+# scp_to_server local_path remote_path
+scp_to_server() {
+    local key; key=$(_expand_key "$SERVER_KEY")
+    scp -i "$key" -P "$SERVER_PORT" \
+        -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+        -r "$1" "${SERVER_USER}@${SERVER_HOST}:$2"
+}
+
+# ── Логирование ──────────────────────────────────────────────────────────────
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
-ok()   { echo "[$(date '+%H:%M:%S')] ✓ $*"; }
-fail() { echo "[$(date '+%H:%M:%S')] ✗ $*" >&2; }
+ok()   { echo "[$(date '+%H:%M:%S')] + $*"; }
+fail() { echo "[$(date '+%H:%M:%S')] - $*" >&2; }

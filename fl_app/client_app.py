@@ -128,7 +128,7 @@ def train(msg: Message, context: Context) -> Message:
         # Research: стратифицированный чанкинг
         shuffle_seed = server_round * 100 + partition_id
         ds = load_from_disk(str(partition_path))
-        lc = "label" if "label" in ds.features else "labels"
+        lc = next(c for c in ("label", "labels", "fine_label", "coarse_label") if c in ds.features)
         ds = stratified_select(ds, sample_budget, lc, seed=shuffle_seed)
     else:
         ds = None  # make_dataloader загрузит с диска сам

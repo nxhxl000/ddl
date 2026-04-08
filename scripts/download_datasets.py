@@ -1,8 +1,8 @@
 """
-Скачивает датасеты (CIFAR-100, PlantVillage) и сохраняет локально в папку data/
+Скачивает датасеты (CIFAR-100, PlantVillage) и сохраняет локально в папку data/raw/
 Запуск:
   python scripts/download_datasets.py
-  python scripts/download_datasets.py --data-dir data
+  python scripts/download_datasets.py --data-dir data/raw
   python scripts/download_datasets.py --only cifar100
   python scripts/download_datasets.py --only plantvillage
   python scripts/download_datasets.py --force
@@ -118,7 +118,7 @@ def download_plantvillage_kaggle(out_dir: Path, force: bool = False) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", default="data", help="Куда сохранять датасеты (по умолчанию: data/)")
+    parser.add_argument("--data-dir", default="data/raw", help="Куда сохранять датасеты (по умолчанию: data/raw/)")
     parser.add_argument(
         "--only",
         choices=["cifar100", "plantvillage", "all"],

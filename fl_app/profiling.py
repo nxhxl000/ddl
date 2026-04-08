@@ -106,7 +106,7 @@ def collect_data_profile(partition_path: Path | str) -> Dict[str, float]:
     """
     ds = load_from_disk(str(partition_path))
     keys = set(ds.features.keys())
-    label_col = "label" if "label" in keys else "labels"
+    label_col = next(c for c in ("label", "labels", "fine_label", "coarse_label") if c in keys)
     labels = ds[label_col]
 
     num_samples = len(labels)
@@ -157,7 +157,7 @@ def run_benchmark(
     ds = load_from_disk(str(partition_path))
     keys = set(ds.features.keys())
     img_col = next((c for c in ("img", "image", "pixel_values") if c in keys), None)
-    label_col = "label" if "label" in keys else "labels"
+    label_col = next(c for c in ("label", "labels", "fine_label", "coarse_label") if c in keys)
 
     n = min(max_samples, len(ds))
     ds = ds.select(range(n))

@@ -12,12 +12,14 @@ from flwr.serverapp import Grid, ServerApp
 from fl_app.artifacts import (
     append_classes_rows,
     append_client_rows,
+    append_index_row,
     append_rounds_row,
     generate_plots,
     init_csvs,
     log_round,
     make_exp_dir,
     print_summary_table,
+    write_config,
     write_log_header,
     write_summary,
 )
@@ -116,25 +118,27 @@ def main(grid: Grid, context: Context) -> None:
 
     # ── Директория и файлы эксперимента ──────────────────────────────────────
     exp_dir, exp_name = make_exp_dir(partition_name, model_name, agg_name)
-    prefix       = exp_dir / f"{num_rounds}r"
-    log_path     = Path(f"{prefix}.log")
-    model_path   = Path(f"{prefix}.pt")
-    rounds_csv   = Path(f"{prefix}__rounds.csv")
-    clients_csv  = Path(f"{prefix}__clients.csv")
-    classes_csv  = Path(f"{prefix}__classes.csv")
-    summary_path = Path(f"{prefix}__summary.json")
 
+    config_path  = exp_dir / "config.json"
+    log_path     = exp_dir / "train.log"
+    model_path   = exp_dir / "model.pt"
+    summary_path = exp_dir / "summary.json"
+    rounds_csv   = exp_dir / "metrics" / "rounds.csv"
+    clients_csv  = exp_dir / "metrics" / "clients.csv"
+    classes_csv  = exp_dir / "metrics" / "classes.csv"
+    plots_dir    = exp_dir / "plots"
+
+    # Записываем конфиг ДО начала обучения
+    write_config(config_path, config=config, model=global_model, device=device)
     write_log_header(log_path, config=config, model=global_model, device=device)
     init_csvs(rounds_csv, clients_csv, classes_csv)
 
     # ── Профилировочный раунд (до основного обучения) ─────────────────────────
-    # Запускается каждый раз — узлы и данные могут меняться между запусками.
-    # Сохраняется в папку эксперимента (уникальную) как снапшот текущего запуска.
     profile_path    = exp_dir / "cluster_profile.json"
     profiles:       dict = {}
     adaptive_flat:  dict = {}
-    server_schedule: dict = {}   # {partition_id: [count_k, ...]}  — empty = disabled
-    effective_js:   float = 0.0  # mean_pairwise_js после добавления серверных данных
+    server_schedule: dict = {}
+    effective_js:   float = 0.0
 
     if enable_profiling:
         print("\nЗапуск профилировочного раунда...")
@@ -213,6 +217,8 @@ def main(grid: Grid, context: Context) -> None:
     def global_evaluate(server_round: int, arrays: ArrayRecord) -> MetricRecord:
         nonlocal cum_comm_mb, prev_acc
 
+        wall_clock = time.time() - run_start
+
         eval_start = time.time()
         model = build_model(model_name)
         model.load_state_dict(arrays.to_torch_state_dict())
@@ -237,7 +243,8 @@ def main(grid: Grid, context: Context) -> None:
                   train_time=train_time, agg_time=agg_time, eval_time=eval_time,
                   effective_js=effective_js)
         cum_comm_mb = append_rounds_row(
-            rounds_csv, server_round=server_round, acc=acc, f1=f1, delta_acc=delta_acc,
+            rounds_csv, server_round=server_round, wall_clock_sec=wall_clock,
+            acc=acc, f1=f1, delta_acc=delta_acc,
             loss=loss, client_logs=client_logs, model_bytes=model_bytes,
             train_time_sec=train_time, agg_time_sec=agg_time, eval_time_sec=eval_time,
             cum_comm_mb=cum_comm_mb, effective_js=effective_js,
@@ -260,7 +267,6 @@ def main(grid: Grid, context: Context) -> None:
         return MetricRecord({"test_loss": float(loss), "test_acc": float(acc), "test_f1": float(f1)})
 
     # ── Собираем статичный train_config ───────────────────────────────────────
-    # server_round_seed не нужен в ConfigRecord: клиент вычисляет из server-round * 997.
     server_flat: dict = {}
     if server_schedule:
         for pid, counts in server_schedule.items():
@@ -288,21 +294,37 @@ def main(grid: Grid, context: Context) -> None:
     # ── Графики ───────────────────────────────────────────────────────────────
     plots = generate_plots(
         rounds_csv, clients_csv, classes_csv,
-        out_prefix=prefix,
+        plots_dir=plots_dir,
         class_names=manifest["class_names"],
         exp_name=exp_name,
     )
 
+    # ── Запись в index.csv ────────────────────────────────────────────────────
+    best_round, best_acc = max(all_round_accs, key=lambda x: x[1])
+    best_f1 = max(all_round_f1s, key=lambda x: x[1])[1] if all_round_f1s else 0.0
+    append_index_row(
+        "experiments",
+        exp_name=exp_name,
+        config=config,
+        best_acc=best_acc,
+        best_f1=best_f1,
+        best_round=best_round,
+        num_rounds=num_rounds,
+        total_time=total_wall_time,
+    )
+
+    # ── Итоговый вывод ────────────────────────────────────────────────────────
     print(f"Эксперимент : {exp_name}")
     print(f"Папка       : {exp_dir.resolve()}")
     print(f"Артефакты   :")
-    print(f"  {model_path.name}")
-    print(f"  {log_path.name}")
-    print(f"  {rounds_csv.name}")
-    print(f"  {clients_csv.name}")
-    print(f"  {classes_csv.name}")
-    print(f"  {summary_path.name}")
+    print(f"  config.json")
+    print(f"  model.pt")
+    print(f"  train.log")
+    print(f"  summary.json")
+    print(f"  metrics/rounds.csv")
+    print(f"  metrics/clients.csv")
+    print(f"  metrics/classes.csv")
     if enable_profiling:
-        print(f"  {profile_path.name}")
+        print(f"  cluster_profile.json")
     for p in sorted(plots, key=lambda x: x.name):
-        print(f"  {p.name}")
+        print(f"  plots/{p.name}")

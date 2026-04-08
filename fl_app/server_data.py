@@ -181,8 +181,6 @@ def sample_server_dataset(
     server_path: Path | str,
     class_counts: List[int],
     round_seed: int,
-    *,
-    label_col: str = "label",
 ):
     """Sample from the local server/ partition according to per-class counts.
 
@@ -190,7 +188,6 @@ def sample_server_dataset(
         server_path:  Path to the local server/ HuggingFace dataset directory.
         class_counts: [count_class_0, ..., count_class_{K-1}].
         round_seed:   Seed for deterministic per-round shuffling within each class.
-        label_col:    Label column name.
 
     Returns:
         HuggingFace Dataset with sum(class_counts) samples.
@@ -198,6 +195,7 @@ def sample_server_dataset(
     from datasets import load_from_disk
 
     server_ds = load_from_disk(str(server_path))
+    label_col = next(c for c in ("label", "labels", "fine_label", "coarse_label") if c in server_ds.features)
     labels    = server_ds[label_col]
 
     class_indices: Dict[int, List[int]] = {}
