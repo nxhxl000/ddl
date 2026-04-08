@@ -26,7 +26,30 @@ class ModelConfig:
     hparams: TrainHParams
 
 
-MODEL_REGISTRY: Dict[str, ModelConfig] = {}
+from fl_app.models.cifar100 import WideResNet
+
+# ── Per-model hyperparameters ─────────────────────────────────────────────────
+#
+# lr снижен с 0.1 (централизованное) до 0.01 (FL): клиент делает 3 эпохи,
+# высокий lr → сильный client drift.
+# batch_size=64: CPU-клиенты + малые партиции (~5-8K сэмплов).
+# Scheduler не используется (3 эпохи на клиенте — бесполезен).
+
+_WRN_28_4_HPARAMS = TrainHParams(
+    lr=0.01,
+    batch_size=64,
+    momentum=0.9,
+    weight_decay=5e-4,
+    num_workers=0,
+)
+
+MODEL_REGISTRY: Dict[str, ModelConfig] = {
+    "wrn_28_4": ModelConfig(
+        cls=WideResNet,
+        kwargs={"depth": 28, "widen": 4, "num_classes": 100, "drop_rate": 0.3},
+        hparams=_WRN_28_4_HPARAMS,
+    ),
+}
 
 
 def build_model(name: str) -> nn.Module:
