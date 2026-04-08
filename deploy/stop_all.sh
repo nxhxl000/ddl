@@ -1,27 +1,23 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# deploy/stop_all.sh — останавливает все Flower процессы на всех VM
+# deploy/stop_all.sh — остановка всех FL-процессов на сервере и клиентах
 # ==============================================================================
-set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-STOP_CMD="
-  tmux kill-session -t superlink 2>/dev/null && echo 'superlink stopped' || true
-  tmux kill-session -t supernode 2>/dev/null && echo 'supernode stopped' || true
-  pkill -f 'flower-superlink' 2>/dev/null || true
-  pkill -f 'flower-supernode' 2>/dev/null || true
-  echo 'Done on \$(hostname)'
-"
+echo "Останавливаю все FL-процессы..."
 
-log "Stopping all Flower processes..."
+# Сервер
+log "Сервер..."
+ssh_server "tmux kill-session -t superlink 2>/dev/null; tmux kill-session -t flwr-run 2>/dev/null; pkill -f flower-superlink 2>/dev/null" 2>/dev/null
+ok "Сервер"
 
-ssh_server "$STOP_CMD" 2>&1 | sed "s/^/[fl-server] /" &
-
-for IDX in "${!CLIENT_INT_IPS[@]}"; do
-  name="${CLIENT_NAMES[$IDX]}"
-  ssh_client "${CLIENT_INT_IPS[$IDX]}" "$STOP_CMD" 2>&1 | sed "s/^/[$name] /" &
+# Клиенты (параллельно)
+for ((i=0; i<NUM_NODES; i++)); do
+    name="${NODE_NAMES[$i]}"
+    log "$name..."
+    ssh_node "$i" "tmux kill-session -t client 2>/dev/null; pkill -f flower-supernode 2>/dev/null" 2>/dev/null &
 done
-
 wait
-log "All stopped."
+
+ok "Все процессы остановлены"

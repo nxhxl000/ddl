@@ -41,28 +41,28 @@ clientapp = "fl_app.client_app:app"
 data-mode = "research"
 
 # Research mode: имя партиции (игнорируется в production)
-partition-name = "cifar100__dirichlet__a0.3__m30__n6__s42"
+partition-name = "cifar100__iid__n5__s42"
 
 model       = "wrn_28_4"     # из MODEL_REGISTRY
 aggregation = "fedavg"       # fedavg | fedprox | ... | scaffold
 
 # FL infrastructure
-num-server-rounds   = 10
+num-server-rounds   = 3
 fraction-train      = 1.0
-min-train-nodes     = 6
-min-available-nodes = 6
+min-train-nodes     = 5
+min-available-nodes = 5
 
 local-epochs = 3        # локальных эпох обучения на каждом клиенте за раунд
 data-dir     = "data/"
 
-enable-profiling = "true"   # профилировочный раунд перед обучением (false — отключить)
+enable-profiling = "false"  # профилировочный раунд перед обучением (false — отключить)
 adaptive-mode    = "maximize-epochs"  # maximize-epochs | maximize-chunk
 
 server-mode = "disabled"  # disabled | shared | exclusive
 
 [tool.flwr.federations]
-default = "yandex-cloud"
+default = "remote"
 
-[tool.flwr.federations.yandex-cloud]
-address = "84.201.165.255:9093"
+[tool.flwr.federations.remote]
+address = "83.149.250.70:9093"
 insecure = true
