@@ -71,13 +71,15 @@ def _infer_columns(ds) -> Tuple[str, str]:
 class _TensorDataset(torch.utils.data.Dataset):
     """Предобработанный датасет: PIL→Tensor один раз, потом из памяти."""
 
-    def __init__(self, images: torch.Tensor, labels: torch.Tensor, augment: bool = False):
+    def __init__(self, images: torch.Tensor, labels: torch.Tensor, augment: bool = False,
+                 image_size: int = 32):
         self.images = images    # (N, C, H, W) float32
         self.labels = labels    # (N,) long
         self.augment = augment
         if augment:
             from torchvision.transforms import RandomCrop, RandomHorizontalFlip
-            self.crop = RandomCrop(images.shape[-1], padding=4)
+            pad = 4 if image_size <= 32 else 0
+            self.crop = RandomCrop(image_size, padding=pad) if pad > 0 else None
             self.flip = RandomHorizontalFlip()
 
     def __len__(self):
@@ -86,9 +88,16 @@ class _TensorDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         img = self.images[idx]
         if self.augment:
-            img = self.crop(img)
+            if self.crop is not None:
+                img = self.crop(img)
             img = self.flip(img)
         return img, self.labels[idx]
+
+
+# Размер входа по модели (всё что > 32 — resize + ImageNet normalize)
+_MODEL_IMAGE_SIZE: Dict[str, int] = {
+    "efficientnet_b0": 224,
+}
 
 
 def make_dataloader(
@@ -99,25 +108,42 @@ def make_dataloader(
     num_workers: int = 0,
     augment: bool = False,
     dataset=None,
+    model_name: str = "",
 ) -> Tuple[DataLoader, str, str]:
     """Загрузить партицию с диска и вернуть DataLoader + имена колонок.
 
     Конвертирует PIL→Tensor один раз при загрузке (кеш в памяти).
-    Аугментация (RandomCrop, RandomHorizontalFlip) применяется на лету к тензорам.
+    Аугментация применяется на лету к тензорам.
 
     dataset: опционально передать уже загруженный HF Dataset.
              Если задан, partition_path игнорируется.
+    model_name: имя модели — определяет размер входа и нормализацию.
     """
-    from torchvision.transforms.functional import to_tensor
+    from torchvision.transforms.functional import to_tensor, resize, normalize
 
     ds = dataset if dataset is not None else load_from_disk(str(partition_path))
     img_col, label_col = _infer_columns(ds)
 
+    image_size = _MODEL_IMAGE_SIZE.get(model_name, 0)
+
     # Конвертируем все PIL→Tensor один раз
-    images = torch.stack([to_tensor(x) for x in ds[img_col]])
+    if image_size > 32:
+        # Большие изображения: resize + ImageNet normalize
+        imgs = []
+        for x in ds[img_col]:
+            t = to_tensor(x)
+            t = resize(t, [image_size, image_size], antialias=True)
+            t = normalize(t, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            imgs.append(t)
+        images = torch.stack(imgs)
+    else:
+        # CIFAR-style: just to_tensor
+        image_size = 32
+        images = torch.stack([to_tensor(x) for x in ds[img_col]])
+
     labels = torch.tensor(ds[label_col], dtype=torch.long)
 
-    tensor_ds = _TensorDataset(images, labels, augment=augment)
+    tensor_ds = _TensorDataset(images, labels, augment=augment, image_size=image_size)
     loader = DataLoader(
         tensor_ds,
         batch_size=batch_size,

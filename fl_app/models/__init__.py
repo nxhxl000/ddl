@@ -28,6 +28,9 @@ class ModelConfig:
 
 from fl_app.models.cifar100 import WideResNet
 from fl_app.models.cifar100.simple_cnn import SimpleCNN
+from fl_app.models.plantvillage.efficientnet import (
+    build_efficientnet_b0_scratch,
+)
 
 # ── Per-model hyperparameters ─────────────────────────────────────────────────
 #
@@ -44,11 +47,27 @@ _WRN_28_4_HPARAMS = TrainHParams(
     num_workers=0,
 )
 
+_WRN_16_4_HPARAMS = TrainHParams(
+    lr=0.01,
+    batch_size=64,
+    momentum=0.9,
+    weight_decay=5e-4,
+    num_workers=0,
+)
+
 _SIMPLE_CNN_HPARAMS = TrainHParams(
     lr=0.01,
     batch_size=64,
     momentum=0.9,
     weight_decay=1e-4,
+    num_workers=0,
+)
+
+_EFFNET_B0_HPARAMS = TrainHParams(
+    lr=1e-3,
+    batch_size=32,
+    momentum=0.0,        # AdamW, не используется
+    weight_decay=1e-2,
     num_workers=0,
 )
 
@@ -58,10 +77,20 @@ MODEL_REGISTRY: Dict[str, ModelConfig] = {
         kwargs={"depth": 28, "widen": 4, "num_classes": 100, "drop_rate": 0.3},
         hparams=_WRN_28_4_HPARAMS,
     ),
+    "wrn_16_4": ModelConfig(
+        cls=WideResNet,
+        kwargs={"depth": 16, "widen": 4, "num_classes": 100, "drop_rate": 0.3},
+        hparams=_WRN_16_4_HPARAMS,
+    ),
     "simple_cnn": ModelConfig(
         cls=SimpleCNN,
         kwargs={"num_classes": 100, "drop_rate": 0.25},
         hparams=_SIMPLE_CNN_HPARAMS,
+    ),
+    "efficientnet_b0": ModelConfig(
+        cls=build_efficientnet_b0_scratch,
+        kwargs={"num_classes": 38},
+        hparams=_EFFNET_B0_HPARAMS,
     ),
 }
 

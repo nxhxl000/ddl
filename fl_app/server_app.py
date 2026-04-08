@@ -79,7 +79,8 @@ def main(grid: Grid, context: Context) -> None:
     # ── Тестовый загрузчик ────────────────────────────────────────────────────
     device = get_device()
     testloader, img_col, label_col = make_dataloader(
-        part_dir / "test", hp.batch_size, shuffle=False, num_workers=hp.num_workers
+        part_dir / "test", hp.batch_size, shuffle=False, num_workers=hp.num_workers,
+        model_name=model_name,
     )
 
     # ── Собранный конфиг эксперимента (для артефактов) ────────────────────────

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import copy
+import logging
 import time
 from pathlib import Path
 
 import torch
 from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict
 from flwr.clientapp import ClientApp
+
+log = logging.getLogger("fl_app.client")
 
 from datasets import load_from_disk, load_dataset
 
@@ -38,6 +41,7 @@ def train(msg: Message, context: Context) -> Message:
     data_dir:       str = rc.get("data-dir", "data/")
 
     # Загружаем веса от сервера
+    log.info(f"[Client] mode={data_mode}, model={model_name}, device={get_device()}")
     model = build_model(model_name)
     model.load_state_dict(msg.content["arrays"].to_torch_state_dict())
     device = get_device()
@@ -151,6 +155,8 @@ def train(msg: Message, context: Context) -> Message:
                 server_ds = sample_server_dataset(server_path, class_counts, round_seed)
 
     # ── Объединяем локальные + серверные данные ────────────────────────────────
+    log.info(f"[Client {partition_id}] Loading data from {partition_path}")
+    t_load = time.perf_counter()
     if server_ds is not None and len(server_ds) > 0:
         from datasets import concatenate_datasets
         local_ds = ds if ds is not None else load_from_disk(str(partition_path))
@@ -158,22 +164,29 @@ def train(msg: Message, context: Context) -> Message:
         loader, img_col, label_col = make_dataloader(
             partition_path, hp.batch_size,
             shuffle=True, num_workers=hp.num_workers, augment=True, dataset=combined_ds,
+            model_name=model_name,
         )
     elif ds is not None:
         loader, img_col, label_col = make_dataloader(
             partition_path, hp.batch_size,
             shuffle=True, num_workers=hp.num_workers, augment=True, dataset=ds,
+            model_name=model_name,
         )
     else:
         loader, img_col, label_col = make_dataloader(
-            partition_path, hp.batch_size, shuffle=True, num_workers=hp.num_workers, augment=True
+            partition_path, hp.batch_size, shuffle=True, num_workers=hp.num_workers, augment=True,
+            model_name=model_name,
         )
+
+    load_time = time.perf_counter() - t_load
+    log.info(f"[Client {partition_id}] Data loaded: {len(loader.dataset)} samples in {load_time:.1f}s")
 
     # Снапшот весов до обучения (нужен для SCAFFOLD c_i_new)
     x0_state = {k: v.clone() for k, v in model.state_dict().items()} if c_server_state else None
 
     global_weights = [p.data.clone() for p in model.parameters()]
 
+    log.info(f"[Client {partition_id}] Training: {local_epochs} epochs, bs={hp.batch_size}, lr={hp.lr}")
     t0 = time.perf_counter()
     epoch_losses, num_examples, total_steps = local_train(
         model, loader,
@@ -189,6 +202,11 @@ def train(msg: Message, context: Context) -> Message:
         c_server=c_server_state,
     )
     round_time = time.perf_counter() - t0
+    log.info(
+        f"[Client {partition_id}] Done: {round_time:.1f}s, "
+        f"loss {epoch_losses[0]:.3f}→{epoch_losses[-1]:.3f}, "
+        f"epochs=[{', '.join(f'{l:.3f}' for l in epoch_losses)}]"
+    )
 
     drift = torch.sqrt(sum(
         (p.data.cpu() - wg).pow(2).sum()
