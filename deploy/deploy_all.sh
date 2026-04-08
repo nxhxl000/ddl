@@ -26,7 +26,7 @@ rsync_to_server() {
   timeout "$RSYNC_TIMEOUT" rsync -az \
     -e "ssh $SSH_OPTS" \
     --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' \
-    --exclude '.git' --exclude '.claude' --exclude 'CLAUDE.md' \
+    --exclude '.git' \
     --exclude 'data/' --exclude 'runs/' \
     --exclude 'notebooks/' --exclude 'client/' \
     ./ "$SSH_USER@$SERVER_EXT:$REMOTE_DIR/" \
