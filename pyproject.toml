@@ -16,8 +16,8 @@ license = "Apache-2.0"
 dependencies = [
     "flwr>=1.22.0",
     "datasets>=2.0.0",
-    "torch==2.7.1",
-    "torchvision==0.22.1",
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -32,16 +32,21 @@ clientapp = "fl_app.client_app:app"
 
 # -----------------------------------------------------
 # Experiment config — только "что запускать"
-# Гиперпараметры модели → fl_app/models.py
+# Гиперпараметры модели → fl_app/models/__init__.py
 # Параметры стратегии   → fl_app/strategies.py
 # -----------------------------------------------------
 [tool.flwr.app.config]
-partition-name      = "cifar10__dirichlet__a0.2__m0__n6__s42__srv10000"
-model               = "cifarcnn"    # cifarcnn | lenet5
-aggregation         = "fedavg"     # fedavg | fedprox | fedavgm | fedadam | fedyogi | fedadagrad | fedmedian | fedtrimmedavg | krum | multikrum | bulyan
+# Режим данных: research (партиции) | production (данные клиента)
+data-mode = "research"
+
+# Research mode: имя партиции (игнорируется в production)
+partition-name = "cifar100__dirichlet__a0.3__m30__n6__s42"
+
+model       = "wrn_28_4"     # из MODEL_REGISTRY
+aggregation = "fedavg"       # fedavg | fedprox | ... | scaffold
 
 # FL infrastructure
-num-server-rounds   = 30
+num-server-rounds   = 10
 fraction-train      = 1.0
 min-train-nodes     = 6
 min-available-nodes = 6
@@ -52,7 +57,7 @@ data-dir     = "data/"
 enable-profiling = "true"   # профилировочный раунд перед обучением (false — отключить)
 adaptive-mode    = "maximize-epochs"  # maximize-epochs | maximize-chunk
 
-server-mode   = "shared"  # disabled | shared | exclusive
+server-mode = "disabled"  # disabled | shared | exclusive
 
 [tool.flwr.federations]
 default = "yandex-cloud"
