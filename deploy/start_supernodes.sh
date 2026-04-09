@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # deploy/start_supernodes.sh — запуск SuperNode на всех клиентских VM
-# Запускать локально с твоего ноутбука.
+# Запускать локально.
 # ==============================================================================
 
 # Намеренно БЕЗ set -e: падение SSH к одному клиенту не должно
@@ -10,32 +10,29 @@
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 SESSION="supernode"
-NUM_PARTITIONS="${#CLIENT_INT_IPS[@]}"
 
-log "Starting $NUM_PARTITIONS SuperNodes (partition-id 0...$((NUM_PARTITIONS-1)))..."
+log "Starting $NUM_NODES SuperNodes (partition-id 0...$((NUM_NODES-1)))..."
 
-for IDX in "${!CLIENT_INT_IPS[@]}"; do
-  int_ip="${CLIENT_INT_IPS[$IDX]}"
-  name="${CLIENT_NAMES[$IDX]}"
-  log "  → $name ($int_ip) partition-id=$IDX"
+for ((i=0; i<NUM_NODES; i++)); do
+  name="${NODE_NAMES[$i]}"
+  log "  → $name (${NODE_HOSTS[$i]}) partition-id=$i"
 
-  ssh_client "$int_ip" "
+  ssh_node "$i" "
     tmux kill-session -t $SESSION 2>/dev/null || true
     tmux new-session -d -s $SESSION \
-      \"bash -c 'cd $REMOTE_DIR && source .venv/bin/activate && exec flower-supernode --superlink $SERVER_INT:9092 --insecure --node-config \"partition-id=$IDX num-partitions=$NUM_PARTITIONS\"'\"
-    echo 'SuperNode partition-id=$IDX started on '\$(hostname)
-  " && log "  ✓ $name OK" \
-    || log "  ✗ $name FAILED"
+      \"bash -c 'cd \$HOME/$REMOTE_DIR && source .venv/bin/activate && exec flower-supernode --superlink ${SERVER_HOST}:${FLOWER_FLEET_PORT} --insecure --node-config \\\"partition-id=$i num-partitions=$NUM_NODES\\\"'\"
+    echo 'SuperNode partition-id=$i started on '\$(hostname)
+  " && log "  + $name OK" \
+    || log "  - $name FAILED"
 done
 
-log "Waiting 4s for SuperNodes to connect..."
-sleep 4
+log "Waiting 5s for SuperNodes to connect..."
+sleep 5
 
 log "Status (tmux sessions):"
-for IDX in "${!CLIENT_INT_IPS[@]}"; do
-  int_ip="${CLIENT_INT_IPS[$IDX]}"
-  name="${CLIENT_NAMES[$IDX]}"
-  RESULT=$(ssh_client "$int_ip" \
+for ((i=0; i<NUM_NODES; i++)); do
+  name="${NODE_NAMES[$i]}"
+  RESULT=$(ssh_node "$i" \
     "tmux list-sessions 2>/dev/null | grep $SESSION || echo 'NO SESSION'" 2>/dev/null \
     || echo "SSH FAILED")
   echo "  $name: $RESULT"

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# deploy/deploy_all.sh — деплой на все VM
+# deploy/deploy_all.sh — деплой на сервер и все клиентские VM
 #
 # FAB (Flower Application Bundle) доставляет код автоматически через SuperLink.
 # Этот скрипт деплоит только:
 #   - на сервер: код проекта + pyproject.toml (для SuperLink + flwr run)
 #   - на клиентов: deploy/setup.sh (для установки зависимостей)
 #
-# Данные (партиции) деплоятся отдельно через cluster.ipynb (ячейка 3.3).
+# Данные (партиции) деплоятся отдельно через deploy/deploy_data.sh или cluster.ipynb.
 #
 # Использование:
-#   bash deploy/deploy_all.sh            # полный деплой
+#   bash deploy/deploy_all.sh              # полный деплой
 #   bash deploy/deploy_all.sh --sync-only  # только rsync, без setup
 # ==============================================================================
 set -euo pipefail
@@ -20,43 +20,56 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 SYNC_ONLY=false
 for arg in "$@"; do [[ "$arg" == "--sync-only" ]] && SYNC_ONLY=true; done
 
-RSYNC_TIMEOUT=60  # сек на один rsync
+RSYNC_TIMEOUT=120  # сек на один rsync
+
+_expand_key() { echo "${1/#\~/$HOME}"; }
+
+# ── Rsync-функции ────────────────────────────────────────────────────────────
 
 rsync_to_server() {
+  local key; key=$(_expand_key "$SERVER_KEY")
+  local ssh_cmd="ssh -i $key -p $SERVER_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=10"
   timeout "$RSYNC_TIMEOUT" rsync -az \
-    -e "ssh $SSH_OPTS" \
+    -e "$ssh_cmd" \
     --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' \
     --exclude '.git' \
     --exclude 'data/' --exclude 'runs/' \
-    --exclude 'notebooks/' --exclude 'client/' \
-    ./ "$SSH_USER@$SERVER_EXT:$REMOTE_DIR/" \
-  && ok "rsync → fl-server" \
-  || { fail "rsync → fl-server FAILED"; return 1; }
+    --exclude 'notebooks/' \
+    ./ "${SERVER_USER}@${SERVER_HOST}:\$HOME/$REMOTE_DIR/" \
+  && ok "rsync → server" \
+  || { fail "rsync → server FAILED"; return 1; }
 }
 
-rsync_to_client() {
-  local name="$1" int_ip="$2"
-  local proxy="ssh $SSH_OPTS -W %h:%p $SSH_USER@$SERVER_EXT"
+rsync_to_node() {
+  local idx="$1"
+  local name="${NODE_NAMES[$idx]}"
+  local host="${NODE_HOSTS[$idx]}"
+  local port="${NODE_PORTS[$idx]}"
+  local user="${NODE_USERS[$idx]}"
+  local key; key=$(_expand_key "${NODE_KEYS[$idx]}")
+  local ssh_cmd="ssh -i $key -p $port -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+
   # На клиентов — только setup.sh и requirements для установки зависимостей.
   # Код приложения доставляется через FAB автоматически.
   timeout "$RSYNC_TIMEOUT" rsync -az \
-    -e "ssh $SSH_OPTS -o 'ProxyCommand=$proxy'" \
+    -e "$ssh_cmd" \
     --include 'deploy/' --include 'deploy/setup.sh' --include 'deploy/common.sh' \
     --include 'deploy/nodes.conf' \
     --include 'requirements.txt' --include 'pyproject.toml' \
-    --include 'client/' --include 'client/**' \
     --exclude '*' \
-    ./ "$SSH_USER@$int_ip:$REMOTE_DIR/" \
+    ./ "${user}@${host}:\$HOME/$REMOTE_DIR/" \
   && ok "rsync → $name" \
   || { fail "rsync → $name FAILED"; return 1; }
 }
 
-# 1. Rsync — параллельно
-log "Syncing to all VMs (parallel, timeout ${RSYNC_TIMEOUT}s each)..."
+# ── 1. Rsync — параллельно ───────────────────────────────────────────────────
+log "Syncing to server + $NUM_NODES clients (parallel, timeout ${RSYNC_TIMEOUT}s each)..."
+
 rsync_to_server &
-for IDX in "${!CLIENT_INT_IPS[@]}"; do
-  rsync_to_client "${CLIENT_NAMES[$IDX]}" "${CLIENT_INT_IPS[$IDX]}" &
+for ((i=0; i<NUM_NODES; i++)); do
+  rsync_to_node "$i" &
 done
+
 RSYNC_FAIL=0
 wait || RSYNC_FAIL=1
 
@@ -68,47 +81,28 @@ log "Rsync phase done."
 
 [[ "$SYNC_ONLY" == true ]] && { log "--sync-only: stopping here."; exit 0; }
 
-# 2. Setup — последовательно
-log "Running setup on fl-server..."
-ssh_server "bash $REMOTE_DIR/deploy/setup.sh" \
-  2>&1 | sed "s/^/[fl-server] /" \
-  && ok "fl-server setup done" \
-  || fail "fl-server setup FAILED"
+# ── 2. Setup — последовательно ───────────────────────────────────────────────
+log "Running setup on server..."
+ssh_server "bash \$HOME/$REMOTE_DIR/deploy/setup.sh" \
+  2>&1 | sed "s/^/[server] /" \
+  && ok "server setup done" \
+  || fail "server setup FAILED"
 
-for IDX in "${!CLIENT_INT_IPS[@]}"; do
-  name="${CLIENT_NAMES[$IDX]}"
-  int_ip="${CLIENT_INT_IPS[$IDX]}"
+for ((i=0; i<NUM_NODES; i++)); do
+  name="${NODE_NAMES[$i]}"
   log "Running setup on $name..."
-  ssh_client "$int_ip" "bash $REMOTE_DIR/deploy/setup.sh" \
+  ssh_node "$i" "bash \$HOME/$REMOTE_DIR/deploy/setup.sh" \
     2>&1 | sed "s/^/[$name] /" \
     && ok "$name setup done" \
     || fail "$name setup FAILED"
 done
 
-# 3. Устанавливаем клиентский пакет на всех клиентах
-log "Installing ddl-fl-client on all client nodes..."
-for IDX in "${!CLIENT_INT_IPS[@]}"; do
-  name="${CLIENT_NAMES[$IDX]}"
-  int_ip="${CLIENT_INT_IPS[$IDX]}"
-  ssh_client "$int_ip" \
-    "cd $REMOTE_DIR && source .venv/bin/activate && pip install -e client/ -q" \
-    && ok "$name: ddl-fl-client installed" \
-    || fail "$name: ddl-fl-client install FAILED"
-done
-
-# 4. Патчим pyproject.toml на сервере
-log "Patching pyproject.toml on server..."
-ssh_server "
-  grep -q 'yandex-cloud' $REMOTE_DIR/pyproject.toml && echo 'already patched' || \
-  printf '\n[tool.flwr.federations.yandex-cloud]\naddress = \"${SERVER_EXT}:9093\"\ninsecure = true\n' \
-    >> $REMOTE_DIR/pyproject.toml && echo 'patched'
-"
-
+# ── 3. Итог ──────────────────────────────────────────────────────────────────
 log "================================================="
-log "Deploy complete!"
+log "Deploy complete! Nodes: server + $NUM_NODES clients"
 log ""
 log "Next steps:"
-log "  1. ssh -i ~/.ssh/admin-fl gleb@$SERVER_EXT 'bash ~/ddl/deploy/start_superlink.sh'"
-log "  2. bash deploy/start_supernodes.sh"
-log "  3. flwr run . yandex-cloud"
+log "  1. bash deploy/start_superlink.sh  (на сервере)"
+log "  2. bash deploy/start_supernodes.sh (локально)"
+log "  3. flwr run . remote"
 log "================================================="

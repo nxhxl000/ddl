@@ -16,7 +16,7 @@ ok "Сервер"
 for ((i=0; i<NUM_NODES; i++)); do
     name="${NODE_NAMES[$i]}"
     log "$name..."
-    ssh_node "$i" "tmux kill-session -t client 2>/dev/null; pkill -f flower-supernode 2>/dev/null" 2>/dev/null &
+    ssh_node "$i" "tmux kill-session -t supernode 2>/dev/null; pkill -f flower-supernode 2>/dev/null" 2>/dev/null &
 done
 wait
 
