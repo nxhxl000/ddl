@@ -37,6 +37,8 @@ htmlcov/
 # =========================
 data/
 runs/
+experiments/
+simulation/
 outputs/
 results/
 

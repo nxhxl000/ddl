@@ -53,6 +53,7 @@ def main(grid: Grid, context: Context) -> None:
     enable_profiling:   bool  = str(rc.get("enable-profiling", "true")).lower() != "false"
     adaptive_mode:      str   = str(rc.get("adaptive-mode", "maximize-epochs"))
     server_mode:        str   = str(rc.get("server-mode", "disabled"))
+    experiments_dir:    str   = str(rc.get("experiments-dir", "experiments"))
 
     # ── Manifest — метаданные партиции ────────────────────────────────────────
     part_dir = Path(data_dir) / "partitions" / partition_name
@@ -118,7 +119,8 @@ def main(grid: Grid, context: Context) -> None:
     }
 
     # ── Директория и файлы эксперимента ──────────────────────────────────────
-    exp_dir, exp_name = make_exp_dir(partition_name, model_name, agg_name)
+    exp_dir, exp_name = make_exp_dir(partition_name, model_name, agg_name,
+                                     experiments_dir=experiments_dir)
 
     config_path  = exp_dir / "config.json"
     log_path     = exp_dir / "train.log"
@@ -304,7 +306,7 @@ def main(grid: Grid, context: Context) -> None:
     best_round, best_acc = max(all_round_accs, key=lambda x: x[1])
     best_f1 = max(all_round_f1s, key=lambda x: x[1])[1] if all_round_f1s else 0.0
     append_index_row(
-        "experiments",
+        experiments_dir,
         exp_name=exp_name,
         config=config,
         best_acc=best_acc,

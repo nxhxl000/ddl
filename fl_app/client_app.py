@@ -186,13 +186,33 @@ def train(msg: Message, context: Context) -> Message:
 
     global_weights = [p.data.clone() for p in model.parameters()]
 
-    log.info(f"[Client {partition_id}] Training: {local_epochs} epochs, bs={hp.batch_size}, lr={hp.lr}")
+    # ── LR decay (опционально) ──────────────────────────────────────────────
+    lr_decay = str(rc.get("lr-decay", "none"))  # none | cosine | step
+    num_rounds = int(rc.get("num-server-rounds", 50))
+    lr = hp.lr
+
+    if lr_decay == "cosine":
+        total_global_epochs = num_rounds * local_epochs
+        global_epoch_offset = (server_round - 1) * local_epochs
+    elif lr_decay == "step":
+        # Step decay: ×0.1 на 50% и 75% раундов
+        total_global_epochs = 0
+        global_epoch_offset = 0
+        if server_round > int(num_rounds * 0.75):
+            lr *= 0.01
+        elif server_round > int(num_rounds * 0.5):
+            lr *= 0.1
+    else:
+        total_global_epochs = 0
+        global_epoch_offset = 0
+
+    log.info(f"[Client {partition_id}] Training: {local_epochs} epochs, bs={hp.batch_size}, lr={lr:.4f}, decay={lr_decay}, round={server_round}/{num_rounds}")
     t0 = time.perf_counter()
     epoch_losses, num_examples, total_steps = local_train(
         model, loader,
         device=device,
         epochs=local_epochs,
-        lr=hp.lr,
+        lr=lr,
         momentum=hp.momentum,
         weight_decay=hp.weight_decay,
         img_col=img_col,
@@ -200,6 +220,8 @@ def train(msg: Message, context: Context) -> Message:
         mu=mu,
         c_i=c_i_state,
         c_server=c_server_state,
+        global_epoch_offset=global_epoch_offset,
+        total_global_epochs=total_global_epochs,
     )
     round_time = time.perf_counter() - t0
     log.info(

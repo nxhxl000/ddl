@@ -48,7 +48,7 @@ _WRN_28_4_HPARAMS = TrainHParams(
 )
 
 _WRN_16_4_HPARAMS = TrainHParams(
-    lr=0.01,
+    lr=0.1,
     batch_size=64,
     momentum=0.9,
     weight_decay=5e-4,
@@ -71,6 +71,14 @@ _EFFNET_B0_HPARAMS = TrainHParams(
     num_workers=0,
 )
 
+_WRN_16_4_GN_HPARAMS = TrainHParams(
+    lr=0.1,
+    batch_size=64,
+    momentum=0.9,
+    weight_decay=5e-4,
+    num_workers=0,
+)
+
 MODEL_REGISTRY: Dict[str, ModelConfig] = {
     "wrn_28_4": ModelConfig(
         cls=WideResNet,
@@ -81,6 +89,12 @@ MODEL_REGISTRY: Dict[str, ModelConfig] = {
         cls=WideResNet,
         kwargs={"depth": 16, "widen": 4, "num_classes": 100, "drop_rate": 0.3},
         hparams=_WRN_16_4_HPARAMS,
+    ),
+    "wrn_16_4_gn": ModelConfig(
+        cls=WideResNet,
+        kwargs={"depth": 16, "widen": 4, "num_classes": 100, "drop_rate": 0.3,
+                "use_group_norm": True},
+        hparams=_WRN_16_4_GN_HPARAMS,
     ),
     "simple_cnn": ModelConfig(
         cls=SimpleCNN,

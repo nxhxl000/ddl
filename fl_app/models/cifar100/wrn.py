@@ -2,12 +2,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _norm_layer(num_channels: int, use_group_norm: bool = False) -> nn.Module:
+    """BatchNorm2d или GroupNorm в зависимости от режима."""
+    if use_group_norm:
+        num_groups = min(32, num_channels // 4) if num_channels >= 4 else 1
+        return nn.GroupNorm(num_groups, num_channels)
+    return nn.BatchNorm2d(num_channels)
+
+
 class WideBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, stride, drop_rate):
+    def __init__(self, in_ch, out_ch, stride, drop_rate, use_group_norm=False):
         super().__init__()
-        self.bn1   = nn.BatchNorm2d(in_ch)
+        self.bn1   = _norm_layer(in_ch, use_group_norm)
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
-        self.bn2   = nn.BatchNorm2d(out_ch)
+        self.bn2   = _norm_layer(out_ch, use_group_norm)
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
         self.drop_rate = drop_rate
         self.shortcut  = (
@@ -34,31 +42,33 @@ class WideResNet(nn.Module):
 
     Обучение: SGD + Nesterov, lr=0.1, MultiStepLR([30,60,80], gamma=0.2), 100 эпох.
     """
-    def __init__(self, depth=28, widen=4, num_classes=100, drop_rate=0.3):
+    def __init__(self, depth=28, widen=4, num_classes=100, drop_rate=0.3,
+                 use_group_norm=False):
         super().__init__()
         assert (depth - 4) % 6 == 0
         n  = (depth - 4) // 6
         ch = [16, 16 * widen, 32 * widen, 64 * widen]
+        self._use_gn = use_group_norm
 
         self.conv0  = nn.Conv2d(3, ch[0], 3, padding=1, bias=False)
         self.group1 = self._group(ch[0], ch[1], n, stride=1, drop_rate=drop_rate)
         self.group2 = self._group(ch[1], ch[2], n, stride=2, drop_rate=drop_rate)
         self.group3 = self._group(ch[2], ch[3], n, stride=2, drop_rate=drop_rate)
-        self.bn     = nn.BatchNorm2d(ch[3])
+        self.bn     = _norm_layer(ch[3], use_group_norm)
         self.fc     = nn.Linear(ch[3], num_classes)
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(m, nn.BatchNorm2d):
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
                 nn.init.ones_(m.weight); nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
                 nn.init.zeros_(m.bias)
 
     def _group(self, in_ch, out_ch, n, stride, drop_rate):
-        layers = [WideBlock(in_ch, out_ch, stride, drop_rate)]
+        layers = [WideBlock(in_ch, out_ch, stride, drop_rate, self._use_gn)]
         for _ in range(1, n):
-            layers.append(WideBlock(out_ch, out_ch, 1, drop_rate))
+            layers.append(WideBlock(out_ch, out_ch, 1, drop_rate, self._use_gn))
         return nn.Sequential(*layers)
 
     def forward(self, x):

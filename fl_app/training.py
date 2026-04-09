@@ -168,6 +168,8 @@ def local_train(
     mu: float = 0.0,
     c_i: Optional[Dict[str, torch.Tensor]] = None,
     c_server: Optional[Dict[str, torch.Tensor]] = None,
+    global_epoch_offset: int = 0,
+    total_global_epochs: int = 0,
 ) -> Tuple[List[float], int, int]:
     """Локальное обучение клиента.
 
@@ -175,11 +177,16 @@ def local_train(
         mu:       FedProx proximal term (0.0 = выключен).
         c_i:      SCAFFOLD client control variate {param_name: tensor}.
         c_server: SCAFFOLD server control variate {param_name: tensor}.
+        global_epoch_offset: номер первой эпохи этого раунда в глобальном расписании.
+        total_global_epochs: общее число эпох за весь FL (num_rounds * local_epochs).
+                             Если >0, lr снижается по cosine от базового lr до 0.
 
     Returns:
         (epoch_losses, num_examples, total_steps)
         total_steps нужен для вычисления c_i_new в SCAFFOLD.
     """
+    import math
+
     model.to(device).train()
     # SCAFFOLD требует чистый SGD без momentum и без lr scheduler:
     # формула c_i_new = (x - y_i) / (K * lr) выведена для plain SGD с постоянным lr.
@@ -194,7 +201,16 @@ def local_train(
         optimizer = torch.optim.SGD(
             model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        # Сквозной cosine decay через все раунды и эпохи
+        if total_global_epochs > 0:
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer,
+                lr_lambda=lambda local_ep: 0.5 * (1 + math.cos(
+                    math.pi * (global_epoch_offset + local_ep) / total_global_epochs
+                )),
+            )
+        else:
+            scheduler = None
     criterion = nn.CrossEntropyLoss()
     global_params = (
         [p.data.clone().to(device) for p in model.parameters()] if mu > 0.0 else None

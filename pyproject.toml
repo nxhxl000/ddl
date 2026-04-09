@@ -55,11 +55,13 @@ min-train-nodes     = 10
 min-available-nodes = 10
 
 local-epochs = 3        # локальных эпох обучения на каждом клиенте за раунд
-data-dir     = "data/"
+data-dir        = "data/"
+experiments-dir = "experiments"   # experiments | simulation
 
 enable-profiling = "false"  # отключён: adaptive вредит на CIFAR-100
 adaptive-mode    = "maximize-epochs"  # не используется при profiling=false
 
+lr-decay     = "none"     # none | cosine (сквозной cosine decay по раундам×эпохам)
 server-mode = "disabled"  # disabled | shared | exclusive
 
 [tool.flwr.federations]
