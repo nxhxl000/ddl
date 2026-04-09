@@ -43,22 +43,22 @@ clientapp = "fl_app.client_app:app"
 data-mode = "research"
 
 # Research mode: имя партиции (игнорируется в production)
-partition-name = "plantvillage__iid__n1__s42"
+partition-name = "cifar100__iid__n10__s42"
 
-model       = "efficientnet_b0"  # simple_cnn | wrn_28_4 | wrn_16_4 | efficientnet_b0
+model       = "wrn_16_4"        # simple_cnn | wrn_28_4 | wrn_16_4 | efficientnet_b0
 aggregation = "fedavg"           # fedavg | fedprox | ... | scaffold
 
 # FL infrastructure
-num-server-rounds   = 2
+num-server-rounds   = 20
 fraction-train      = 1.0
-min-train-nodes     = 1
-min-available-nodes = 1
+min-train-nodes     = 10
+min-available-nodes = 10
 
 local-epochs = 3        # локальных эпох обучения на каждом клиенте за раунд
 data-dir     = "data/"
 
-enable-profiling = "false"  # профилировочный раунд перед обучением (false — отключить)
-adaptive-mode    = "maximize-epochs"  # maximize-epochs | maximize-chunk
+enable-profiling = "false"  # отключён: adaptive вредит на CIFAR-100
+adaptive-mode    = "maximize-epochs"  # не используется при profiling=false
 
 server-mode = "disabled"  # disabled | shared | exclusive
 
@@ -68,3 +68,8 @@ default = "remote"
 [tool.flwr.federations.remote]
 address = "83.149.250.70:9093"
 insecure = true
+
+[tool.flwr.federations.local-sim]
+options.num-supernodes = 10
+options.backend.client-resources.num-cpus = 2
+options.backend.client-resources.num-gpus = 0.1
