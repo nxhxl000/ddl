@@ -43,25 +43,25 @@ clientapp = "fl_app.client_app:app"
 data-mode = "research"
 
 # Research mode: имя партиции (игнорируется в production)
-partition-name = "cifar100__iid__n10__s42"
+partition-name = "cifar100__dirichlet__a2.5__m0__n10__s42"
 
 model       = "wrn_16_4"        # simple_cnn | wrn_28_4 | wrn_16_4 | efficientnet_b0
 aggregation = "fedavg"           # fedavg | fedprox | ... | scaffold
 
 # FL infrastructure
-num-server-rounds   = 20
+num-server-rounds   = 80
 fraction-train      = 1.0
 min-train-nodes     = 10
 min-available-nodes = 10
 
 local-epochs = 3        # локальных эпох обучения на каждом клиенте за раунд
 data-dir        = "data/"
-experiments-dir = "experiments"   # experiments | simulation
+experiments-dir = "simulation"   # experiments | simulation
 
 enable-profiling = "false"  # отключён: adaptive вредит на CIFAR-100
 adaptive-mode    = "maximize-epochs"  # не используется при profiling=false
 
-lr-decay     = "none"     # none | cosine (сквозной cosine decay по раундам×эпохам)
+lr-decay     = "step"     # none | cosine | step (×0.1 @50%, ×0.01 @75%)
 server-mode = "disabled"  # disabled | shared | exclusive
 
 [tool.flwr.federations]

@@ -53,7 +53,8 @@ def _entropy_norm(dist: Dict[int, int], num_classes: int) -> float:
 def _js_divergence(dist_a: Dict[int, int], dist_b: Dict[int, int], num_classes: int) -> float:
     """Jensen-Shannon дивергенция между двумя распределениями классов (счётчики).
 
-    Возвращает значение в [0, 1]: 0 = одинаковые, 1 = максимально разные.
+    Нормирована на ln 2, поэтому возвращает значение в [0, 1]:
+    0 = одинаковые, 1 = непересекающиеся носители.
     """
     n_a = sum(dist_a.values())
     n_b = sum(dist_b.values())
@@ -66,7 +67,8 @@ def _js_divergence(dist_a: Dict[int, int], dist_b: Dict[int, int], num_classes: 
     def _kl(a: Dict[int, float]) -> float:
         return sum(a[c] * math.log(a[c] / m[c]) for c in range(num_classes) if a[c] > 0)
 
-    return round(0.5 * _kl(p) + 0.5 * _kl(q), 4)
+    js_nats = 0.5 * _kl(p) + 0.5 * _kl(q)
+    return round(js_nats / math.log(2), 4)
 
 
 def _mean_pairwise_js(dists: List[Dict[int, int]], num_classes: int) -> float:
@@ -84,18 +86,90 @@ def _mean_pairwise_js(dists: List[Dict[int, int]], num_classes: int) -> float:
 
 # ── Клиентские утилиты ────────────────────────────────────────────────────────
 
+def _cpu_freq_from_proc() -> float:
+    """Fallback: средняя частота CPU из /proc/cpuinfo (Linux). 0.0 если не найдено."""
+    try:
+        freqs: List[float] = []
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("cpu MHz"):
+                    freqs.append(float(line.split(":")[1].strip()))
+        return sum(freqs) / len(freqs) if freqs else 0.0
+    except Exception:
+        return 0.0
+
+
+def _cpu_count_from_proc(logical: bool) -> int:
+    """Fallback: число CPU из /proc/cpuinfo. logical=True → 'processor', False → уникальные core id."""
+    try:
+        if logical:
+            with open("/proc/cpuinfo") as f:
+                return sum(1 for line in f if line.startswith("processor"))
+        # Физические: считаем уникальные пары (physical id, core id)
+        cores = set()
+        phys_id = core_id = None
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("physical id"):
+                    phys_id = line.split(":")[1].strip()
+                elif line.startswith("core id"):
+                    core_id = line.split(":")[1].strip()
+                elif line.strip() == "" and phys_id is not None and core_id is not None:
+                    cores.add((phys_id, core_id))
+                    phys_id = core_id = None
+        return len(cores) if cores else 0
+    except Exception:
+        return 0
+
+
 def collect_hardware_info() -> Dict[str, float]:
-    """Собрать CPU/RAM. Возвращает dict[str, float] для MetricRecord."""
-    if not _PSUTIL:
-        return {}
-    cpu_freq = psutil.cpu_freq()
-    mem = psutil.virtual_memory()
+    """Собрать CPU/RAM. Возвращает dict[str, float] для MetricRecord.
+
+    Fallback: при отсутствии psutil или возврате None из psutil.cpu_freq()
+    читаем /proc/cpuinfo и /proc/meminfo напрямую.
+    """
+    cpu_logical  = 0
+    cpu_physical = 0
+    cpu_freq_mhz = 0.0
+    ram_total_gb = 0.0
+    ram_avail_gb = 0.0
+
+    if _PSUTIL:
+        try:
+            cpu_logical  = int(psutil.cpu_count(logical=True)  or 0)
+            cpu_physical = int(psutil.cpu_count(logical=False) or 0)
+            cf = psutil.cpu_freq()
+            if cf is not None and cf.current:
+                cpu_freq_mhz = float(cf.current)
+            mem = psutil.virtual_memory()
+            ram_total_gb = round(mem.total     / 1e9, 2)
+            ram_avail_gb = round(mem.available / 1e9, 2)
+        except Exception:
+            pass
+
+    if cpu_logical == 0:
+        cpu_logical = _cpu_count_from_proc(logical=True)
+    if cpu_physical == 0:
+        cpu_physical = _cpu_count_from_proc(logical=False) or cpu_logical
+    if cpu_freq_mhz == 0.0:
+        cpu_freq_mhz = _cpu_freq_from_proc()
+    if ram_total_gb == 0.0:
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        ram_total_gb = round(int(line.split()[1]) * 1024 / 1e9, 2)
+                    elif line.startswith("MemAvailable:"):
+                        ram_avail_gb = round(int(line.split()[1]) * 1024 / 1e9, 2)
+        except Exception:
+            pass
+
     return {
-        "hw_cpu_logical":  float(psutil.cpu_count(logical=True) or 0),
-        "hw_cpu_physical": float(psutil.cpu_count(logical=False) or 0),
-        "hw_cpu_freq_mhz": float(cpu_freq.current if cpu_freq else 0.0),
-        "hw_ram_total_gb": round(mem.total / 1e9, 2),
-        "hw_ram_avail_gb": round(mem.available / 1e9, 2),
+        "hw_cpu_logical":  float(cpu_logical),
+        "hw_cpu_physical": float(cpu_physical),
+        "hw_cpu_freq_mhz": float(cpu_freq_mhz),
+        "hw_ram_total_gb": float(ram_total_gb),
+        "hw_ram_avail_gb": float(ram_avail_gb),
     }
 
 
@@ -174,6 +248,7 @@ def run_benchmark(
     criterion = nn.CrossEntropyLoss()
 
     epoch_times: list[float] = []
+    batch_times: list[float] = []
     samples_per_epoch = 0
     final_loss = 0.0
 
@@ -181,12 +256,14 @@ def run_benchmark(
         t0 = time.perf_counter()
         epoch_loss, batches, epoch_samples = 0.0, 0, 0
         for batch in loader:
+            tb = time.perf_counter()
             x = batch[img_col].to(device)
             y = batch[label_col].to(device)
             optimizer.zero_grad(set_to_none=True)
             loss = criterion(model(x), y)
             loss.backward()
             optimizer.step()
+            batch_times.append(time.perf_counter() - tb)
             epoch_loss += float(loss.item())
             batches += 1
             epoch_samples += len(y)
@@ -197,6 +274,15 @@ def run_benchmark(
     mean_epoch_sec = sum(epoch_times) / len(epoch_times) if epoch_times else 0.0
     sps = samples_per_epoch / mean_epoch_sec if mean_epoch_sec > 0 else 0.0
 
+    if batch_times:
+        mean_batch_sec = sum(batch_times) / len(batch_times)
+        var_batch = sum((t - mean_batch_sec) ** 2 for t in batch_times) / len(batch_times)
+        std_batch_ms = math.sqrt(var_batch) * 1000.0
+        mean_batch_ms = mean_batch_sec * 1000.0
+        cv_batch = std_batch_ms / mean_batch_ms if mean_batch_ms > 0 else 0.0
+    else:
+        mean_batch_ms = std_batch_ms = cv_batch = 0.0
+
     return {
         "bench_samples":         float(samples_per_epoch),
         "bench_epochs":          float(epochs),
@@ -204,6 +290,10 @@ def run_benchmark(
         "bench_samples_per_sec": round(sps, 1),
         "bench_time_per_1k_sec": round(1000.0 / sps, 3) if sps > 0 else 0.0,
         "bench_final_loss":      round(final_loss, 4),
+        "bench_mean_batch_ms":   round(mean_batch_ms, 3),
+        "bench_std_batch_ms":    round(std_batch_ms, 3),
+        "bench_cv_batch":        round(cv_batch, 4),
+        "bench_n_batches":       float(len(batch_times)),
     }
 
 

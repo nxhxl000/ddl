@@ -54,6 +54,7 @@ def main(grid: Grid, context: Context) -> None:
     adaptive_mode:      str   = str(rc.get("adaptive-mode", "maximize-epochs"))
     server_mode:        str   = str(rc.get("server-mode", "disabled"))
     experiments_dir:    str   = str(rc.get("experiments-dir", "experiments"))
+    lr_decay:           str   = str(rc.get("lr-decay", "none"))
 
     # ── Manifest — метаданные партиции ────────────────────────────────────────
     part_dir = Path(data_dir) / "partitions" / partition_name
@@ -109,6 +110,7 @@ def main(grid: Grid, context: Context) -> None:
         "momentum":     hp.momentum,
         "weight_decay": hp.weight_decay,
         "num_workers":  hp.num_workers,
+        "lr_decay":     lr_decay,
         # strategy params (из strategies.py)
         **{f"strategy_{k}": v for k, v in strategy_params.items()},
         # adaptive
@@ -238,7 +240,7 @@ def main(grid: Grid, context: Context) -> None:
         agg_end   = strategy._agg_end_times.get(server_round, agg_start)
         agg_time  = agg_end - agg_start
         train_time = max(
-            (v["round_time_sec"] for v in client_logs.values()), default=0.0
+            (v["total_sec"] for v in client_logs.values()), default=0.0
         )
 
         log_round(log_path, server_round=server_round, client_logs=client_logs,

@@ -144,10 +144,16 @@ class ScaffoldStrategy(FedAvg):
             if "metrics" in rep.content:
                 m: MetricRecord = rep.content["metrics"]  # type: ignore[assignment]
                 cid = int(m.get("partition-id", float(src)))
+                data_load = float(m.get("data-load-sec", 0.0))
+                compute   = float(m.get("compute-sec",   0.0))
+                serialize = float(m.get("serialize-sec", 0.0))
                 per_round[cid] = {
                     "first_epoch_loss": float(m.get("first-epoch-loss", 0.0)),
                     "last_epoch_loss":  float(m.get("last-epoch-loss", 0.0)),
-                    "round_time_sec":   float(m.get("round-time-sec", 0.0)),
+                    "data_load_sec":    data_load,
+                    "compute_sec":      compute,
+                    "serialize_sec":    serialize,
+                    "total_sec":        data_load + compute + serialize,
                     "local_epochs":     int(m.get("local-epochs", 0)),
                     "num_examples":     int(m.get("num-examples", 0)),
                     "src_node_id":      int(src),
@@ -227,10 +233,16 @@ def _make_logging_cls(base_cls: Type) -> Type:
                     continue
                 m: MetricRecord = rep.content["metrics"]  # type: ignore[assignment]
                 cid = int(m.get("partition-id", float(src)))
+                data_load = float(m.get("data-load-sec", 0.0))
+                compute   = float(m.get("compute-sec",   0.0))
+                serialize = float(m.get("serialize-sec", 0.0))
                 per_round[cid] = {
                     "first_epoch_loss": float(m.get("first-epoch-loss", 0.0)),
                     "last_epoch_loss":  float(m.get("last-epoch-loss", 0.0)),
-                    "round_time_sec":   float(m.get("round-time-sec", 0.0)),
+                    "data_load_sec":    data_load,
+                    "compute_sec":      compute,
+                    "serialize_sec":    serialize,
+                    "total_sec":        data_load + compute + serialize,
                     "local_epochs":     int(m.get("local-epochs", 0)),
                     "num_examples":     int(m.get("num-examples", 0)),
                     "src_node_id":      int(src),

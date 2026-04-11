@@ -223,12 +223,15 @@ def train(msg: Message, context: Context) -> Message:
         global_epoch_offset=global_epoch_offset,
         total_global_epochs=total_global_epochs,
     )
-    round_time = time.perf_counter() - t0
+    compute_time = time.perf_counter() - t0
     log.info(
-        f"[Client {partition_id}] Done: {round_time:.1f}s, "
+        f"[Client {partition_id}] Done: {compute_time:.1f}s, "
         f"loss {epoch_losses[0]:.3f}→{epoch_losses[-1]:.3f}, "
         f"epochs=[{', '.join(f'{l:.3f}' for l in epoch_losses)}]"
     )
+
+    # ── Сериализация результата (drift, SCAFFOLD c_i, ArrayRecord) ────────────
+    t_serialize = time.perf_counter()
 
     drift = torch.sqrt(sum(
         (p.data.cpu() - wg).pow(2).sum()
@@ -254,13 +257,17 @@ def train(msg: Message, context: Context) -> Message:
             for name in c_i_state
         })
 
-    arrays  = ArrayRecord(model.state_dict())
+    arrays = ArrayRecord(model.state_dict())
+    serialize_time = time.perf_counter() - t_serialize
+
     metrics = MetricRecord({
         "train_loss":       float(sum(epoch_losses) / max(len(epoch_losses), 1)),
         "num-examples":     float(num_examples),
         "partition-id":     float(partition_id),
         "local-epochs":     float(local_epochs),
-        "round-time-sec":   float(round_time),
+        "data-load-sec":    float(load_time),
+        "compute-sec":      float(compute_time),
+        "serialize-sec":    float(serialize_time),
         "first-epoch-loss": float(epoch_losses[0])  if epoch_losses else 0.0,
         "last-epoch-loss":  float(epoch_losses[-1]) if epoch_losses else 0.0,
         "drift":            float(drift),

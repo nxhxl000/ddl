@@ -195,7 +195,8 @@ def init_csvs(rounds_path: Path, clients_path: Path, classes_path: Path) -> None
         csv.writer(f).writerow([
             "round", "client_id", "num_examples", "local_epochs",
             "train_loss_last", "train_loss_first", "local_improvement",
-            "round_time_sec", "sec_per_1k", "drift",
+            "data_load_sec", "compute_sec", "serialize_sec", "total_sec",
+            "sec_per_1k_compute", "drift",
         ])
     with classes_path.open("w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([
@@ -224,12 +225,17 @@ def log_round(
             p = client_logs[cid]
             improvement = p["first_epoch_loss"] - p["last_epoch_loss"]
             n = p["num_examples"]
-            sec_per_1k = p["round_time_sec"] / n * 1000 if n > 0 else 0.0
+            compute = p["compute_sec"]
+            sec_per_1k = compute / n * 1000 if n > 0 else 0.0
             f.write(f"  Client {cid + 1}:\n")
             f.write(f"    first epoch loss : {p['first_epoch_loss']:.6f}\n")
             f.write(f"    last  epoch loss : {p['last_epoch_loss']:.6f}  (Δ {improvement:+.6f})\n")
             f.write(f"    drift ||Δw||     : {p['drift']:.6f}\n")
-            f.write(f"    train time       : {p['round_time_sec']:.2f}s  ({sec_per_1k:.2f}s/1k examples)\n")
+            f.write(
+                f"    timing           : load={p['data_load_sec']:.2f}s  "
+                f"compute={compute:.2f}s  ser={p['serialize_sec']:.2f}s  "
+                f"total={p['total_sec']:.2f}s  ({sec_per_1k:.2f}s/1k)\n"
+            )
         f.write(f"  Timing: train={train_time:.1f}s  agg={agg_time:.2f}s  eval={eval_time:.2f}s"
                 f"  total={train_time + agg_time + eval_time:.1f}s\n")
         js_str = f"  effective_js={effective_js:.4f}" if effective_js > 0.0 else ""
@@ -255,7 +261,9 @@ def append_rounds_row(
 ) -> float:
     """Добавить строку в rounds.csv. Возвращает обновлённый cum_comm_mb."""
     n = len(client_logs)
-    client_times = [v["round_time_sec"] for v in client_logs.values()]
+    # max/mean/min/std считаем по полному client wall time (load+compute+serialize),
+    # т.к. сервер ждёт самый медленный total — это и есть честный straggler signal.
+    client_times = [v["total_sec"] for v in client_logs.values()]
     losses       = [v["last_epoch_loss"] for v in client_logs.values()]
     drifts       = [v["drift"] for v in client_logs.values()]
 
@@ -304,14 +312,18 @@ def append_client_rows(
         for cid, v in sorted(client_logs.items()):
             improvement = v["first_epoch_loss"] - v["last_epoch_loss"]
             n = v["num_examples"]
-            sec_per_1k = v["round_time_sec"] / n * 1000 if n > 0 else 0.0
+            compute = v["compute_sec"]
+            sec_per_1k = compute / n * 1000 if n > 0 else 0.0
             w.writerow([
                 server_round, cid,
                 n, v["local_epochs"],
                 f"{v['last_epoch_loss']:.6f}",
                 f"{v['first_epoch_loss']:.6f}",
                 f"{improvement:.6f}",
-                f"{v['round_time_sec']:.2f}",
+                f"{v['data_load_sec']:.2f}",
+                f"{compute:.2f}",
+                f"{v['serialize_sec']:.2f}",
+                f"{v['total_sec']:.2f}",
                 f"{sec_per_1k:.3f}",
                 f"{v['drift']:.6f}",
             ])

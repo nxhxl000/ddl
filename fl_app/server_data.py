@@ -126,12 +126,14 @@ def compute_effective_js(
 
     uniform = 1.0 / num_classes
 
+    ln2 = math.log(2)
+
     def _js(p: List[float], q: List[float]) -> float:
         m = [(pi + qi) / 2 for pi, qi in zip(p, q)]
         kl = lambda a, b: sum(
             ai * math.log(ai / bi) for ai, bi in zip(a, b) if ai > 1e-12 and bi > 1e-12
         )
-        return 0.5 * kl(p, m) + 0.5 * kl(q, m)  # JS in nats, matches profiling.py
+        return (0.5 * kl(p, m) + 0.5 * kl(q, m)) / ln2  # normalised to [0, 1], matches profiling.py
 
     # Build effective distributions Q_i
     Q: Dict[int, List[float]] = {}
