@@ -1,309 +1,249 @@
+"""Стратегии агрегации: FedAvg, FedAvgM, FedProx, SCAFFOLD.
+
+Три первых — встроены в flwr 1.28, просто реэкспорт с параметрами.
+SCAFFOLD реализован здесь (наследник FedAvg).
+
+Публичный API: build_strategy(name, cfg) -> Strategy
+"""
+
 from __future__ import annotations
 
-import dataclasses
-import time
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Optional, Tuple, Type
+from collections.abc import Iterable
+from typing import Any
 
-import torch
-from flwr.app import ArrayRecord, Message, MetricRecord
-from flwr.serverapp.strategy import (
-    Bulyan,
-    FedAdam,
-    FedAdagrad,
-    FedAvg,
-    FedAvgM,
-    FedMedian,
-    FedProx,
-    FedTrimmedAvg,
-    FedYogi,
-    Krum,
-    MultiKrum,
-)
+import logging
+import math
+
+import numpy as np
+from flwr.common import Array, ArrayRecord, ConfigRecord, Message, MetricRecord, RecordDict
+from flwr.server import Grid
+from flwr.serverapp.strategy import FedAvg, FedAvgM, FedProx
+
+log = logging.getLogger(__name__)
 
 
-# ── Strategy configs (дефолтные параметры) ───────────────────────────────────
-
-@dataclass
-class FedAvgCfg:
-    pass
-
-@dataclass
-class FedProxCfg:
-    proximal_mu: float = 0.01
-
-@dataclass
-class FedAvgMCfg:
-    server_learning_rate: float = 1.0
-    server_momentum:      float = 0.9
-
-@dataclass
-class FedAdamCfg:
-    eta:    float = 0.01
-    eta_l:  float = 0.001
-    beta_1: float = 0.9
-    beta_2: float = 0.99
-    tau:    float = 1e-9
-
-@dataclass
-class FedYogiCfg:
-    eta:    float = 0.01
-    eta_l:  float = 0.001
-    beta_1: float = 0.9
-    beta_2: float = 0.99
-    tau:    float = 1e-9
-
-@dataclass
-class FedAdagradCfg:
-    eta:   float = 0.01
-    eta_l: float = 0.001
-    tau:   float = 1e-9
-
-@dataclass
-class FedMedianCfg:
-    pass
-
-@dataclass
-class FedTrimmedAvgCfg:
-    beta: float = 0.2
-
-@dataclass
-class KrumCfg:
-    num_malicious_nodes: int = 0
-
-@dataclass
-class MultiKrumCfg:
-    num_malicious_nodes:  int = 0
-    num_nodes_to_select:  int = 1
-
-@dataclass
-class BulyanCfg:
-    num_malicious_nodes: int = 0
-
-@dataclass
-class ScaffoldCfg:
-    pass  # параметры совпадают с FedAvg; server_lr=1.0 зафиксирован в алгоритме
+def _nd_norm(nds) -> float:
+    return float(np.sqrt(sum(float((a.astype(np.float64) ** 2).sum()) for a in nds)))
 
 
-# ── SCAFFOLD Strategy ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# FedAvgM с корректной обработкой BN buffers
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Стандартный FedAvgM применяет моментум (экстраполяцию в пространстве весов)
+# ко ВСЕМ ключам state_dict, включая BN running_mean/running_var.
+# running_var — неотрицательная статистика; экстраполяция может загнать его в <0
+# → sqrt(var) = NaN на следующем forward.
+#
+# Правильное поведение: моментум — только для trainable параметров.
+# BN buffers усредняются как в FedAvg.
 
-class ScaffoldStrategy(FedAvg):
-    """SCAFFOLD: Stochastic Controlled Averaging for Federated Learning.
 
-    Корректирует client drift через control variates:
-      - c_server (глобальный) хранится на сервере, передаётся клиентам каждый раунд
-      - c_i (локальный) хранится в context.state клиента, персистентно между раундами
-      - Поправка к градиенту: grad += c_server - c_i
-      - Обновление c_i (Option I): c_i_new = c_i - c_server + (x - y_i) / (K * lr)
-      - Обновление c_server: c = c + (1/n) * sum(delta_c_i)
+def _is_bn_buffer(key: str) -> bool:
+    return key.endswith(("running_mean", "running_var", "num_batches_tracked"))
 
-    Ref: Karimireddy et al. "SCAFFOLD: Stochastic Controlled Averaging
-         for Federated Learning", ICML 2020.
-    """
+
+class FedAvgMBn(FedAvgM):
+    """FedAvgM с исключением BN buffers из server-side momentum."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.diagnostics: list[dict] = []
+
+    def aggregate_train(self, server_round, replies):
+        # Обходим родительский FedAvgM.aggregate_train и идём сразу в FedAvg
+        # чтобы получить чистое взвешенное среднее.
+        agg_arrays, agg_metrics = FedAvg.aggregate_train(self, server_round, replies)
+
+        if not self.server_opt or agg_arrays is None:
+            return agg_arrays, agg_metrics
+
+        if self.current_arrays is None:
+            self.current_arrays = agg_arrays
+            return agg_arrays, agg_metrics
+
+        old_nd = self.current_arrays.to_numpy_ndarrays()
+        new_nd = agg_arrays.to_numpy_ndarrays()
+        keys = list(agg_arrays.keys())
+
+        raw_delta = [o - n for o, n in zip(old_nd, new_nd)]
+        pseudo_grad = raw_delta
+
+        if self.server_momentum > 0.0:
+            if self.momentum_vector is None:
+                self.momentum_vector = pseudo_grad
+            else:
+                self.momentum_vector = [
+                    self.server_momentum * mv + g
+                    for mv, g in zip(self.momentum_vector, pseudo_grad)
+                ]
+            pseudo_grad = self.momentum_vector
+
+        updated: list[Array] = []
+        for k, o, n, g in zip(keys, old_nd, new_nd, pseudo_grad):
+            if _is_bn_buffer(k):
+                updated.append(Array(np.asarray(n)))              # чистое среднее
+            else:
+                updated.append(Array(np.asarray(o - self.server_learning_rate * g)))
+
+        agg_arrays = ArrayRecord(dict(zip(keys, updated)))
+        self.current_arrays = agg_arrays
+
+        # Метрики считаем только по trainable (исключая BN buffers),
+        # иначе num_batches_tracked даёт ложно огромные нормы.
+        train_idx = [i for i, k in enumerate(keys) if not _is_bn_buffer(k)]
+        delta_norm = _nd_norm([raw_delta[i] for i in train_idx])
+        mom_norm = (
+            _nd_norm([self.momentum_vector[i] for i in train_idx])
+            if self.momentum_vector is not None else 0.0
+        )
+        self.diagnostics.append({
+            "round": server_round, "delta_norm": delta_norm, "momentum_norm": mom_norm,
+        })
+        print(f"  [FedAvgMBn r{server_round}] delta-norm={delta_norm:.4f}  momentum-norm={mom_norm:.4f}", flush=True)
+        return agg_arrays, agg_metrics
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCAFFOLD
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Сервер хранит:     веса x (ArrayRecord, управляется flwr) + c_server (ArrayRecord)
+# Клиент хранит:     c_i (persistent в context.state)
+# S→C payload:       arrays=x, config[...] + arrays-доп.ключ "c_server"
+# C→S reply:         arrays=y_i, metrics{num-examples,...} + arrays-доп.ключ "c_delta"
+#
+# Ключевой трюк: Flower ждёт ровно 1 ArrayRecord в reply, поэтому c_delta
+# кладётся в тот же ArrayRecord под зарезервированным префиксом, и сервер
+# извлекает/удаляет его до вызова super().aggregate_train().
+
+C_SERVER_KEY = "c_server"          # отдельный ArrayRecord в payload S→C
+C_DELTA_PREFIX = "__c_delta__/"    # префикс для ключей Δc_i внутри reply-ArrayRecord
+
+
+class Scaffold(FedAvg):
+    """SCAFFOLD (Karimireddy et al., 2020) поверх FedAvg."""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._c_server: Optional[ArrayRecord] = None  # инициализируется в первом раунде
-        # Поля совместимости с LoggingStrategy (нужны server_app.py)
-        self.round_client_logs: Dict[int, Dict[int, Dict[str, Any]]] = {}
-        self._agg_start_times: Dict[int, float] = {}
-        self._agg_end_times:   Dict[int, float] = {}
+        self._c_server: ArrayRecord | None = None   # инициализируется в первом раунде
+        self.diagnostics: list[dict] = []
 
     def configure_train(
-        self, server_round: int, arrays: ArrayRecord, config: Any, grid: Any
+        self, server_round: int, arrays: ArrayRecord, config: ConfigRecord, grid: Grid
     ) -> Iterable[Message]:
-        # Инициализируем c_server нулями по структуре модели
+        # Первый раунд: c_server = нули той же формы, что веса
         if self._c_server is None:
-            state = arrays.to_torch_state_dict()
-            self._c_server = ArrayRecord({k: torch.zeros_like(v) for k, v in state.items()})
+            self._c_server = ArrayRecord(
+                {k: Array(np.zeros_like(a.numpy())) for k, a in arrays.items()}
+            )
 
-        # Базовая логика FedAvg (node selection, server-round injection)
-        messages = list(super().configure_train(server_round, arrays, config, grid))
-
-        # Добавляем c_server в каждое сообщение
-        for msg in messages:
-            msg.content["c_server"] = self._c_server
-
-        return messages
+        # Кладём c_server в payload отдельным ArrayRecord
+        # Переопределяем _construct_messages через временный RecordDict
+        node_ids, _ = _sample(self, grid)
+        config["server-round"] = server_round
+        record = RecordDict({
+            self.arrayrecord_key: arrays,
+            self.configrecord_key: config,
+            C_SERVER_KEY: self._c_server,
+        })
+        return [
+            Message(content=record, message_type="train", dst_node_id=nid)
+            for nid in node_ids
+        ]
 
     def aggregate_train(
         self, server_round: int, replies: Iterable[Message]
-    ) -> Tuple[Optional[ArrayRecord], Optional[MetricRecord]]:
-        replies_list = list(replies)
-        per_round: Dict[int, Dict[str, Any]] = {}
+    ) -> tuple[ArrayRecord | None, MetricRecord | None]:
+        replies = list(replies)
 
-        # Извлекаем c_delta и логируем метрики
-        c_delta_sum: Optional[Dict[str, torch.Tensor]] = None
-        n_scaffold = 0
-
-        for rep in replies_list:
-            if not rep.has_content():
+        # Извлекаем Δc_i из каждого reply и удаляем до валидации flwr
+        deltas: list[dict[str, np.ndarray]] = []
+        for msg in replies:
+            if msg.has_error():
                 continue
-            src = rep.metadata.src_node_id
+            ar = msg.content[self.arrayrecord_key]
+            d = {}
+            for k in list(ar.keys()):
+                if k.startswith(C_DELTA_PREFIX):
+                    d[k[len(C_DELTA_PREFIX):]] = ar[k].numpy()
+                    del ar[k]
+            deltas.append(d)
 
-            if "metrics" in rep.content:
-                m: MetricRecord = rep.content["metrics"]  # type: ignore[assignment]
-                cid = int(m.get("partition-id", float(src)))
-                data_load = float(m.get("data-load-sec", 0.0))
-                compute   = float(m.get("compute-sec",   0.0))
-                serialize = float(m.get("serialize-sec", 0.0))
-                per_round[cid] = {
-                    "first_epoch_loss": float(m.get("first-epoch-loss", 0.0)),
-                    "last_epoch_loss":  float(m.get("last-epoch-loss", 0.0)),
-                    "data_load_sec":    data_load,
-                    "compute_sec":      compute,
-                    "serialize_sec":    serialize,
-                    "total_sec":        data_load + compute + serialize,
-                    "local_epochs":     int(m.get("local-epochs", 0)),
-                    "num_examples":     int(m.get("num-examples", 0)),
-                    "src_node_id":      int(src),
-                    "drift":            float(m.get("drift", 0.0)),
-                }
+        # Обычная агрегация весов + метрик
+        arrays, metrics = super().aggregate_train(server_round, replies)
 
-            if "c_delta" in rep.content:
-                delta_state = rep.content["c_delta"].to_torch_state_dict()
-                # Удаляем до вызова super() — FedAvg требует ровно один ArrayRecord
-                del rep.content["c_delta"]
-                if c_delta_sum is None:
-                    c_delta_sum = {k: torch.zeros_like(v) for k, v in delta_state.items()}
-                for k, v in delta_state.items():
-                    c_delta_sum[k] += v
-                n_scaffold += 1
+        # c_server += (1/M) * Σ Δc_i    где M = общее число участников (= min_train_nodes)
+        if deltas and self._c_server is not None:
+            m = float(self.min_train_nodes)
+            keys = list(self._c_server.keys())
+            c_np = {k: self._c_server[k].numpy() for k in keys}
+            for d in deltas:
+                for k in keys:
+                    if k in d:
+                        c_np[k] = c_np[k] + d[k] / m
+            self._c_server = ArrayRecord({k: Array(v) for k, v in c_np.items()})
 
-        # Обновляем c_server: c = c + (1/n) * sum(delta_c_i)
-        if c_delta_sum is not None and n_scaffold > 0 and self._c_server is not None:
-            c_state = self._c_server.to_torch_state_dict()
-            self._c_server = ArrayRecord({
-                k: c_state[k] + c_delta_sum[k] / n_scaffold
-                for k in c_state
-            })
-
-        self.round_client_logs[server_round] = per_round
-        self._agg_start_times[server_round] = time.time()
-        result = super().aggregate_train(server_round, replies_list)
-        self._agg_end_times[server_round] = time.time()
-        return result
-
-    def get_round_logs(self, server_round: int) -> Dict[int, Dict[str, Any]]:
-        return self.round_client_logs.get(server_round, {})
+        c_norm = _nd_norm([a.numpy() for a in self._c_server.values()]) if self._c_server else 0.0
+        self.diagnostics.append({"round": server_round, "c_server_norm": c_norm})
+        print(f"  [SCAFFOLD r{server_round}] c-server-norm={c_norm:.4f}", flush=True)
+        return arrays, metrics
 
 
-# ── Registry ──────────────────────────────────────────────────────────────────
-
-# Стратегии, требующие минимум 2 клиентов
-_MIN_2 = {"fedmedian", "fedtrimmedavg", "krum", "multikrum", "bulyan"}
-
-STRATEGY_REGISTRY: Dict[str, Tuple[Type, Any]] = {
-    "fedavg":        (FedAvg,        FedAvgCfg()),
-    "fedprox":       (FedProx,       FedProxCfg()),
-    "fedavgm":       (FedAvgM,       FedAvgMCfg()),
-    "fedadam":       (FedAdam,       FedAdamCfg()),
-    "fedyogi":       (FedYogi,       FedYogiCfg()),
-    "fedadagrad":    (FedAdagrad,    FedAdagradCfg()),
-    "fedmedian":     (FedMedian,     FedMedianCfg()),
-    "fedtrimmedavg": (FedTrimmedAvg, FedTrimmedAvgCfg()),
-    "krum":          (Krum,          KrumCfg()),
-    "multikrum":     (MultiKrum,     MultiKrumCfg()),
-    "bulyan":        (Bulyan,        BulyanCfg()),
-    "scaffold":      (ScaffoldStrategy, ScaffoldCfg()),
-}
+# Небольшой helper вместо дублирования sample_nodes
+def _sample(strat: FedAvg, grid: Grid) -> tuple[list[int], list[int]]:
+    from flwr.serverapp.strategy.strategy_utils import sample_nodes
+    total = list(grid.get_node_ids())
+    sample_size = max(int(len(total) * strat.fraction_train), strat.min_train_nodes)
+    return sample_nodes(grid, strat.min_available_nodes, sample_size)
 
 
-# ── LoggingStrategy wrapper ───────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Factory
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _make_logging_cls(base_cls: Type) -> Type:
-    """Оборачивает стратегию: перехватывает aggregate_train для сбора метрик клиентов."""
-
-    class LoggingStrategy(base_cls):  # type: ignore[misc]
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            super().__init__(*args, **kwargs)
-            self.round_client_logs: Dict[int, Dict[int, Dict[str, Any]]] = {}
-            self._agg_start_times: Dict[int, float] = {}
-            self._agg_end_times:   Dict[int, float] = {}
-
-        def aggregate_train(
-            self, server_round: int, replies: Iterable[Message]
-        ) -> Tuple[Optional[ArrayRecord], Optional[MetricRecord]]:
-            replies_list = list(replies)
-            per_round: Dict[int, Dict[str, Any]] = {}
-
-            for rep in replies_list:
-                src = rep.metadata.src_node_id
-                if not rep.has_content() or "metrics" not in rep.content:
-                    continue
-                m: MetricRecord = rep.content["metrics"]  # type: ignore[assignment]
-                cid = int(m.get("partition-id", float(src)))
-                data_load = float(m.get("data-load-sec", 0.0))
-                compute   = float(m.get("compute-sec",   0.0))
-                serialize = float(m.get("serialize-sec", 0.0))
-                per_round[cid] = {
-                    "first_epoch_loss": float(m.get("first-epoch-loss", 0.0)),
-                    "last_epoch_loss":  float(m.get("last-epoch-loss", 0.0)),
-                    "data_load_sec":    data_load,
-                    "compute_sec":      compute,
-                    "serialize_sec":    serialize,
-                    "total_sec":        data_load + compute + serialize,
-                    "local_epochs":     int(m.get("local-epochs", 0)),
-                    "num_examples":     int(m.get("num-examples", 0)),
-                    "src_node_id":      int(src),
-                    "drift":            float(m.get("drift", 0.0)),
-                }
-
-            self.round_client_logs[server_round] = per_round
-            self._agg_start_times[server_round] = time.time()
-            result = super().aggregate_train(server_round, replies_list)
-            self._agg_end_times[server_round] = time.time()
-            return result
-
-        def get_round_logs(self, server_round: int) -> Dict[int, Dict[str, Any]]:
-            return self.round_client_logs.get(server_round, {})
-
-    return LoggingStrategy
-
-
-# ── Public API ────────────────────────────────────────────────────────────────
-
-def build_strategy(
-    name: str,
-    *,
-    fraction_train: float,
-    min_train_nodes: int,
-    min_available_nodes: int,
-) -> Tuple[Any, Dict[str, Any]]:
-    """Создать стратегию по имени с параметрами из реестра.
-
-    Returns:
-        (strategy_instance, params_dict) — экземпляр стратегии и dict её параметров
-        для сохранения в артефакты эксперимента.
+def with_cosine_lr_decay(strategy: FedAvg, num_rounds: int) -> FedAvg:
+    """Оборачивает strategy.configure_train: в config добавляется `lr-scale`
+    по cosine-кривой от 1.0 (r=1) до 0.0 (r=num_rounds).
+    Клиент умножает свой base_lr на lr-scale.
     """
-    key = name.strip().lower()
-    if key not in STRATEGY_REGISTRY:
-        raise ValueError(
-            f"Unknown aggregation '{name}'. Available: {sorted(STRATEGY_REGISTRY)}"
-        )
+    original = strategy.configure_train
 
-    base_cls, cfg = STRATEGY_REGISTRY[key]
-    params: Dict[str, Any] = dataclasses.asdict(cfg)
+    def wrapped(server_round, arrays, config, grid):
+        t = (server_round - 1) / max(num_rounds, 1)
+        config["lr-scale"] = float(0.5 * (1.0 + math.cos(math.pi * t)))
+        return original(server_round, arrays, config, grid)
 
-    if key in _MIN_2:
-        min_train_nodes    = max(min_train_nodes, 2)
-        min_available_nodes = max(min_available_nodes, 2)
+    strategy.configure_train = wrapped
+    return strategy
 
+
+def build_strategy(name: str, *, cfg: dict[str, Any]) -> FedAvg:
+    """Собрать стратегию по имени. cfg — полный run_config из pyproject.toml.
+
+    Используемые ключи cfg (остальные игнорируются):
+      общие: min-train-nodes, min-available-nodes, fraction-train
+      fedavgm:  server-momentum, server-lr
+      fedprox:  proximal-mu
+    """
     common = dict(
-        fraction_train=fraction_train,
-        fraction_evaluate=0.0,
-        min_train_nodes=min_train_nodes,
+        fraction_train=float(cfg.get("fraction-train", 1.0)),
+        fraction_evaluate=0.0,                  # central evaluate на сервере, federated выключен
+        min_train_nodes=int(cfg.get("min-train-nodes", 2)),
         min_evaluate_nodes=0,
-        min_available_nodes=min_available_nodes,
-        weighted_by_key="num-examples",
-        arrayrecord_key="arrays",
-        configrecord_key="config",
+        min_available_nodes=int(cfg.get("min-available-nodes", 2)),
     )
-
-    # ScaffoldStrategy уже включает logging — не оборачиваем через _make_logging_cls
-    if key == "scaffold":
-        strategy = ScaffoldStrategy(**common, **params)
-    else:
-        LoggingCls = _make_logging_cls(base_cls)
-        strategy = LoggingCls(**common, **params)
-    return strategy, params
+    name = name.lower()
+    if name == "fedavg":
+        return FedAvg(**common)
+    if name == "fedavgm":
+        return FedAvgMBn(
+            **common,
+            server_learning_rate=float(cfg.get("server-lr", 1.0)),
+            server_momentum=float(cfg.get("server-momentum", 0.9)),
+        )
+    if name == "fedprox":
+        return FedProx(**common, proximal_mu=float(cfg.get("proximal-mu", 0.01)))
+    if name == "scaffold":
+        return Scaffold(**common)
+    raise ValueError(f"unknown aggregation: {name!r}")

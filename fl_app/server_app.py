@@ -1,335 +1,299 @@
+"""Flower ServerApp — центральная evaluate + сохранение артефактов."""
+
 from __future__ import annotations
 
 import json
-import time
+from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple
 
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import torch
 from flwr.app import ArrayRecord, ConfigRecord, Context, MetricRecord
 from flwr.serverapp import Grid, ServerApp
+from flwr.serverapp.strategy.strategy_utils import aggregate_metricrecords
 
-from fl_app.artifacts import (
-    append_classes_rows,
-    append_client_rows,
-    append_index_row,
-    append_rounds_row,
-    generate_plots,
-    init_csvs,
-    log_round,
-    make_exp_dir,
-    print_summary_table,
-    write_config,
-    write_log_header,
-    write_summary,
+from fl_app.data import build_loader
+from fl_app.models import build_model
+from fl_app.profiling import (
+    print_profiling_summary,
+    run_profiling_round,
+    save_cluster_profile,
 )
-from fl_app.models import build_model, get_hparams
-from fl_app.adaptive import compute_adaptive_params, make_adaptive_log, print_adaptive_summary, to_train_config_dict
-from fl_app.profiling import print_profiling_summary, run_profiling_round, save_cluster_profile
-from fl_app.server_data import (
-    compute_effective_js, compute_server_schedule,
-    make_server_log, print_server_schedule_summary, to_server_config_dict,
-)
-from fl_app.strategies import build_strategy
-from fl_app.training import evaluate, get_device, make_dataloader
+from fl_app.strategies import build_strategy, with_cosine_lr_decay
+from fl_app.training import evaluate, get_device
 
 app = ServerApp()
+
+# CIFAR-100: 20 суперклассов × 5 fine classes (стандартный маппинг)
+CIFAR100_SUPERCLASSES = [
+    ("aquatic mammals",   [4, 30, 55, 72, 95]),
+    ("fish",              [1, 32, 67, 73, 91]),
+    ("flowers",           [54, 62, 70, 82, 92]),
+    ("food containers",   [9, 10, 16, 28, 61]),
+    ("fruit/vegetables",  [0, 51, 53, 57, 83]),
+    ("electrical devices",[22, 39, 40, 86, 87]),
+    ("furniture",         [5, 20, 25, 84, 94]),
+    ("insects",           [6, 7, 14, 18, 24]),
+    ("large carnivores",  [3, 42, 43, 88, 97]),
+    ("man-made outdoor",  [12, 17, 37, 68, 76]),
+    ("natural outdoor",   [23, 33, 49, 60, 71]),
+    ("large omni/herb",   [15, 19, 21, 31, 38]),
+    ("medium mammals",    [34, 63, 64, 66, 75]),
+    ("non-insect inv.",   [26, 45, 77, 79, 99]),
+    ("people",            [2, 11, 35, 46, 98]),
+    ("reptiles",          [27, 29, 44, 78, 93]),
+    ("small mammals",     [36, 50, 65, 74, 80]),
+    ("trees",             [47, 52, 56, 59, 96]),
+    ("vehicles 1",        [8, 13, 48, 58, 90]),
+    ("vehicles 2",        [41, 69, 81, 85, 89]),
+]
+CIFAR100_FINE_NAMES = [
+    "apple","aquarium_fish","baby","bear","beaver","bed","bee","beetle","bicycle","bottle",
+    "bowl","boy","bridge","bus","butterfly","camel","can","castle","caterpillar","cattle",
+    "chair","chimpanzee","clock","cloud","cockroach","couch","crab","crocodile","cup","dinosaur",
+    "dolphin","elephant","flatfish","forest","fox","girl","hamster","house","kangaroo","keyboard",
+    "lamp","lawn_mower","leopard","lion","lizard","lobster","man","maple_tree","motorcycle","mountain",
+    "mouse","mushroom","oak_tree","orange","orchid","otter","palm_tree","pear","pickup_truck","pine_tree",
+    "plain","plate","poppy","porcupine","possum","rabbit","raccoon","ray","road","rocket",
+    "rose","sea","seal","shark","shrew","skunk","skyscraper","snail","snake","spider",
+    "squirrel","streetcar","sunflower","sweet_pepper","table","tank","telephone","television","tiger","tractor",
+    "train","trout","tulip","turtle","wardrobe","whale","willow_tree","wolf","woman","worm",
+]
+
+_PLOT_RC = {
+    "figure.facecolor": "white", "axes.facecolor": "white",
+    "axes.grid": True, "grid.alpha": 0.35, "grid.linestyle": "--",
+    "font.size": 11,
+}
+
+
+def _line_plot(df, metric, ylabel, color, title, out_path):
+    with plt.rc_context(_PLOT_RC):
+        fig, ax1 = plt.subplots(figsize=(10, 5))
+        ax1.plot(df["round"], df[metric] * 100, color=color, linewidth=2,
+                 marker="o", markersize=5, label=ylabel)
+        ax1.set_xlabel("Round"); ax1.set_ylabel(f"{ylabel} (%)", color=color)
+        ax1.tick_params(axis="y", labelcolor=color); ax1.set_ylim(bottom=0)
+        best_i = df[metric].idxmax()
+        br, bv = int(df.loc[best_i, "round"]), float(df.loc[best_i, metric]) * 100
+        ax1.scatter(br, bv, color="gold", s=200, zorder=6, marker="*",
+                    label=f"Best: {bv:.1f}% (r{br})", edgecolors="goldenrod")
+        ax2 = ax1.twinx()
+        ax2.plot(df["round"], df["test_loss"], color="tomato", linewidth=1.5,
+                 linestyle="--", alpha=0.8, label="Test Loss")
+        ax2.set_ylabel("Loss", color="tomato"); ax2.tick_params(axis="y", labelcolor="tomato")
+        h1, l1 = ax1.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
+        ax1.legend(h1 + h2, l1 + l2, loc="lower right")
+        ax1.set_title(title, pad=10)
+        fig.tight_layout(); fig.savefig(out_path, dpi=150, bbox_inches="tight"); plt.close(fig)
+
+
+def _boxplot_train_loss(df_cli, out_path, title):
+    rounds = sorted(df_cli["round"].unique())
+    data = [df_cli[df_cli["round"] == r]["train_loss_last"].dropna().values for r in rounds]
+    means = [d.mean() if len(d) else 0.0 for d in data]
+    with plt.rc_context(_PLOT_RC):
+        fig, ax = plt.subplots(figsize=(max(8, len(rounds) * 0.3 + 2), 5))
+        ax.boxplot(data, positions=rounds, widths=0.55, patch_artist=True,
+                   boxprops=dict(facecolor="steelblue", alpha=0.45, linewidth=1.2),
+                   medianprops=dict(color="navy", linewidth=2),
+                   whiskerprops=dict(color="steelblue", linewidth=1.2),
+                   capprops=dict(color="steelblue", linewidth=1.5),
+                   flierprops=dict(marker="o", color="gray", markersize=4, alpha=0.5))
+        ax.plot(rounds, means, color="tomato", linestyle="--", linewidth=1.5, alpha=0.8, zorder=5)
+        ax.scatter(rounds, means, color="tomato", marker="D", s=50, zorder=6,
+                   edgecolors="darkred", linewidths=0.5, label="Mean")
+        ax.set_xlabel("Round"); ax.set_ylabel("Train Loss")
+        step = max(1, len(rounds) // 20)
+        ax.set_xticks(rounds[::step])
+        ax.legend(); ax.set_title(title, pad=10)
+        fig.tight_layout(); fig.savefig(out_path, dpi=150, bbox_inches="tight"); plt.close(fig)
+
+
+def _cifar100_superclass_heatmap(per_class, out_path, title):
+    grid = np.array([[per_class[c] for c in fine] for _, fine in CIFAR100_SUPERCLASSES])
+    labels = np.array([[CIFAR100_FINE_NAMES[c] for c in fine] for _, fine in CIFAR100_SUPERCLASSES])
+    superclass_names = [s for s, _ in CIFAR100_SUPERCLASSES]
+    with plt.rc_context(_PLOT_RC):
+        fig, ax = plt.subplots(figsize=(11, 11))
+        im = ax.imshow(grid, aspect="auto", cmap="RdYlGn", vmin=0, vmax=1)
+        plt.colorbar(im, ax=ax, label="Accuracy", shrink=0.7, pad=0.02)
+        ax.set_xticks(range(5)); ax.set_xticklabels([f"#{i+1}" for i in range(5)])
+        ax.set_yticks(range(20)); ax.set_yticklabels(superclass_names)
+        ax.set_xlabel("Fine class index within superclass"); ax.set_ylabel("Superclass")
+        ax.set_title(title, pad=10); ax.grid(False)
+        for i in range(20):
+            for j in range(5):
+                v = grid[i, j]
+                color = "white" if v < 0.45 else "black"
+                ax.text(j, i, f"{labels[i, j]}\n{v:.2f}", ha="center", va="center",
+                        fontsize=7, color=color, fontweight="bold")
+        fig.tight_layout(); fig.savefig(out_path, dpi=150, bbox_inches="tight"); plt.close(fig)
 
 
 @app.main()
 def main(grid: Grid, context: Context) -> None:
     rc = context.run_config
+    model_name = rc["model"]
+    agg_name = str(rc["aggregation"]).lower()
+    num_rounds = int(rc.get("num-server-rounds", 10))
+    local_epochs = int(rc.get("local-epochs", 3))
+    partition = rc["partition-name"]
+    data_dir = rc.get("data-dir", "data/")
+    exp_root = rc.get("experiments-dir", "simulation")
 
-    # ── Config из pyproject ───────────────────────────────────────────────────
-    partition_name:     str   = rc["partition-name"]
-    model_name:         str   = rc["model"]
-    agg_name:           str   = rc["aggregation"]
-    num_rounds:         int   = int(rc.get("num-server-rounds", 10))
-    fraction_train:     float = float(rc.get("fraction-train", 1.0))
-    min_train_nodes:    int   = int(rc.get("min-train-nodes", 1))
-    min_available_nodes: int  = int(rc.get("min-available-nodes", 1))
-    local_epochs:       int   = int(rc.get("local-epochs", 5))
-    data_dir:           str   = rc.get("data-dir", "data/")
-    enable_profiling:   bool  = str(rc.get("enable-profiling", "true")).lower() != "false"
-    adaptive_mode:      str   = str(rc.get("adaptive-mode", "maximize-epochs"))
-    server_mode:        str   = str(rc.get("server-mode", "disabled"))
-    experiments_dir:    str   = str(rc.get("experiments-dir", "experiments"))
-    lr_decay:           str   = str(rc.get("lr-decay", "none"))
+    # Модель и начальные веса
+    model = build_model(model_name)
+    initial_arrays = ArrayRecord(model.state_dict())
+    comm_mb = sum(a.numpy().nbytes for a in initial_arrays.values()) / (1024 ** 2)
 
-    # ── Manifest — метаданные партиции ────────────────────────────────────────
-    part_dir = Path(data_dir) / "partitions" / partition_name
-    manifest = json.loads((part_dir / "manifest.json").read_text())
-
-    # ── Модель + гиперпараметры ───────────────────────────────────────────────
-    hp = get_hparams(model_name)
-    global_model = build_model(model_name)
-    model_bytes = sum(
-        int(t.numel() * t.element_size())
-        for t in global_model.state_dict().values()
-        if hasattr(t, "numel")
+    # Test loader — централизованная evaluate на стороне сервера
+    test_loader = build_loader(
+        Path(data_dir) / "partitions" / partition / "test",
+        batch_size=256, train=False,
     )
-    initial_arrays = ArrayRecord(global_model.state_dict())
-
-    # ── Стратегия ─────────────────────────────────────────────────────────────
-    strategy, strategy_params = build_strategy(
-        agg_name,
-        fraction_train=fraction_train,
-        min_train_nodes=min_train_nodes,
-        min_available_nodes=min_available_nodes,
-    )
-
-    # ── Тестовый загрузчик ────────────────────────────────────────────────────
     device = get_device()
-    testloader, img_col, label_col = make_dataloader(
-        part_dir / "test", hp.batch_size, shuffle=False, num_workers=hp.num_workers,
-        model_name=model_name,
-    )
 
-    # ── Собранный конфиг эксперимента (для артефактов) ────────────────────────
-    config = {
-        # pyproject
-        "partition_name":      partition_name,
-        "model":               model_name,
-        "aggregation":         agg_name,
-        "num_rounds":          num_rounds,
-        "fraction_train":      fraction_train,
-        "min_train_nodes":     min_train_nodes,
-        "min_available_nodes": min_available_nodes,
-        # manifest
-        "dataset":     manifest["dataset"],
-        "scheme":      manifest["scheme"],
-        "alpha":       manifest.get("alpha"),
-        "num_clients": manifest["num_clients"],
-        "num_classes": manifest["num_classes"],
-        "class_names": manifest["class_names"],
-        "test_size":   manifest.get("test_size"),
-        # hparams (из models.py + pyproject.toml)
-        "lr":           hp.lr,
-        "batch_size":   hp.batch_size,
-        "local_epochs": local_epochs,
-        "momentum":     hp.momentum,
-        "weight_decay": hp.weight_decay,
-        "num_workers":  hp.num_workers,
-        "lr_decay":     lr_decay,
-        # strategy params (из strategies.py)
-        **{f"strategy_{k}": v for k, v in strategy_params.items()},
-        # adaptive
-        "enable_profiling": enable_profiling,
-        "adaptive_mode":    adaptive_mode if enable_profiling else "disabled",
-        # server dataset
-        "server_mode": server_mode,
-    }
+    # Дир эксперимента: {root}/{dataset}/{model}/{agg}/{partition_tail}__{timestamp}/
+    dataset, _, partition_tail = partition.partition("__")
+    partition_tail = partition_tail.replace("__", "_") or "default"
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    exp_dir = Path(exp_root) / dataset / model_name / agg_name / f"{partition_tail}__r{num_rounds}__{timestamp}"
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    (exp_dir / "config.json").write_text(json.dumps(dict(rc), indent=2, default=str))
 
-    # ── Директория и файлы эксперимента ──────────────────────────────────────
-    exp_dir, exp_name = make_exp_dir(partition_name, model_name, agg_name,
-                                     experiments_dir=experiments_dir)
-
-    config_path  = exp_dir / "config.json"
-    log_path     = exp_dir / "train.log"
-    model_path   = exp_dir / "model.pt"
-    summary_path = exp_dir / "summary.json"
-    rounds_csv   = exp_dir / "metrics" / "rounds.csv"
-    clients_csv  = exp_dir / "metrics" / "clients.csv"
-    classes_csv  = exp_dir / "metrics" / "classes.csv"
-    plots_dir    = exp_dir / "plots"
-
-    # Записываем конфиг ДО начала обучения
-    write_config(config_path, config=config, model=global_model, device=device)
-    write_log_header(log_path, config=config, model=global_model, device=device)
-    init_csvs(rounds_csv, clients_csv, classes_csv)
-
-    # ── Профилировочный раунд (до основного обучения) ─────────────────────────
-    profile_path    = exp_dir / "cluster_profile.json"
-    profiles:       dict = {}
-    adaptive_flat:  dict = {}
-    server_schedule: dict = {}
-    effective_js:   float = 0.0
-
-    if enable_profiling:
-        print("\nЗапуск профилировочного раунда...")
+    # ── Профилировочный раунд (опционально) ───────────────────────────────────
+    if str(rc.get("enable-profiling", "false")).lower() == "true":
+        min_nodes = int(rc.get("min-train-nodes", 1))
+        min_avail = int(rc.get("min-available-nodes", min_nodes))
         profiles = run_profiling_round(
-            grid=grid,
-            initial_arrays=initial_arrays,
-            fraction_train=fraction_train,
-            min_train_nodes=min_train_nodes,
-            min_available_nodes=min_available_nodes,
+            grid, initial_arrays,
+            fraction_train=float(rc.get("fraction-train", 1.0)),
+            min_train_nodes=min_nodes,
+            min_available_nodes=min_avail,
+            benchmark_samples=int(rc.get("benchmark-samples", 1000)),
+            benchmark_epochs=int(rc.get("benchmark-epochs", 2)),
         )
-        save_cluster_profile(
-            profiles, exp_dir,
-            partition_name=partition_name,
-            num_classes=manifest["num_classes"],
-        )
-        print_profiling_summary(profiles, num_classes=manifest["num_classes"])
-        print(f"  Профиль сохранён: {profile_path.name}")
+        num_classes = 100 if "cifar100" in dataset else 10
+        save_cluster_profile(profiles, exp_dir, partition_name=partition, num_classes=num_classes)
+        print_profiling_summary(profiles, num_classes=num_classes)
 
-        # ── Адаптивное расписание (straggler mitigation) ──────────────────────
-        adaptive_params = compute_adaptive_params(profiles, base_epochs=local_epochs, mode=adaptive_mode)
-        adaptive_flat   = to_train_config_dict(adaptive_params)
-        print_adaptive_summary(adaptive_params, profiles, base_epochs=local_epochs, mode=adaptive_mode, tolerance=0.10)
+    # Перехват per-client метрик
+    per_client_rows: list[dict] = []
+    round_counter = [0]
 
-        # Дописываем адаптивное расписание в cluster_profile.json
-        adaptive_log = make_adaptive_log(adaptive_params, profiles, local_epochs, adaptive_mode, tolerance=0.10)
-        profile_data = json.loads(profile_path.read_text())
-        profile_data["adaptive_schedule"] = adaptive_log
+    def train_aggr(reply_contents, weighted_by_key):
+        round_counter[0] += 1
+        r = round_counter[0]
+        drifts = []
+        for rd in reply_contents:
+            m = rd["metrics"]
+            drift = float(m.get("w-drift", 0))
+            drifts.append(drift)
+            per_client_rows.append({
+                "round": r,
+                "num_examples":     float(m.get("num-examples", 0)),
+                "train_loss_first": float(m.get("train-loss-first", 0)),
+                "train_loss_last":  float(m.get("train-loss-last", 0)),
+                "t_compute":        float(m.get("t-compute", 0)),
+                "w_drift":          drift,
+                "update_norm_rel":  float(m.get("update-norm-rel", 0)),
+                "grad_norm_last":   float(m.get("grad-norm-last", 0)),
+            })
+        if drifts:
+            print(f"  [r{r}] drift mean={sum(drifts)/len(drifts):.4f}  max={max(drifts):.4f}  min={min(drifts):.4f}")
+        return aggregate_metricrecords(reply_contents, weighted_by_key)
 
-        # ── Серверный датасет (если режим не disabled и server/ существует) ────
-        server_dir  = part_dir / "server"
-        server_size = manifest.get("server_size")
-        if server_mode != "disabled" and server_size and server_dir.exists():
-            print("\nВычисление расписания серверного датасета...")
-            server_schedule = compute_server_schedule(
-                profiles,
-                num_classes=manifest["num_classes"],
-                server_size=server_size,
-                mode=server_mode,
-            )
-            js_before = profile_data.get("mean_pairwise_js", 0.0)
-            effective_js = compute_effective_js(
-                server_schedule, profiles, manifest["num_classes"]
-            )
-            print_server_schedule_summary(
-                server_schedule, profiles,
-                num_classes=manifest["num_classes"],
-                server_size=server_size,
-                mode=server_mode,
-                class_names=manifest["class_names"],
-                mean_pairwise_js_before=js_before,
-            )
-            profile_data["server_schedule"] = make_server_log(
-                server_schedule, profiles,
-                num_classes=manifest["num_classes"],
-                server_size=server_size,
-                mode=server_mode,
-                mean_pairwise_js_before=js_before,
-            )
-        elif server_mode != "disabled":
-            if not server_size:
-                print("\n[server-data] server-mode задан, но партиция не содержит server/ (server_size=None в manifest). Пропускаем.")
-            elif not server_dir.exists():
-                print(f"\n[server-data] server-mode задан, но {server_dir} не найден. Пропускаем.")
+    strategy = build_strategy(agg_name, cfg=rc)
+    strategy = with_cosine_lr_decay(strategy, num_rounds)
+    strategy.train_metrics_aggr_fn = train_aggr
 
-        profile_path.write_text(json.dumps(profile_data, indent=2, ensure_ascii=False))
-        print()
+    # Callback центральной evaluate + трекинг лучшей модели
+    best = {"acc": -1.0, "round": 0, "arrays": None}
+    def eval_fn(server_round: int, arrays: ArrayRecord):
+        m = build_model(model_name)
+        m.load_state_dict(arrays.to_torch_state_dict(), strict=True)
+        r = evaluate(m, test_loader, device)
+        if r["acc"] > best["acc"]:
+            best["acc"] = r["acc"]
+            best["round"] = server_round
+            best["arrays"] = arrays
+        return MetricRecord({
+            "test-loss": r["loss"],
+            "test-acc":  r["acc"],
+            "test-f1":   r["f1_macro"],
+        })
 
-    # ── Состояние FL-цикла ────────────────────────────────────────────────────
-    run_start = time.time()
-    cum_comm_mb = 0.0
-    prev_acc = 0.0
-    all_round_accs: List[Tuple[int, float]] = []
-    all_round_f1s:  List[Tuple[int, float]] = []
-
-    # ── Callback оценки после каждого раунда ─────────────────────────────────
-    def global_evaluate(server_round: int, arrays: ArrayRecord) -> MetricRecord:
-        nonlocal cum_comm_mb, prev_acc
-
-        wall_clock = time.time() - run_start
-
-        eval_start = time.time()
-        model = build_model(model_name)
-        model.load_state_dict(arrays.to_torch_state_dict())
-        loss, acc, per_class, f1 = evaluate(
-            model, testloader, device=device, img_col=img_col, label_col=label_col
-        )
-        eval_time = time.time() - eval_start
-
-        delta_acc   = acc - prev_acc
-        prev_acc    = acc
-        client_logs = strategy.get_round_logs(server_round)
-
-        agg_start = strategy._agg_start_times.get(server_round, eval_start)
-        agg_end   = strategy._agg_end_times.get(server_round, agg_start)
-        agg_time  = agg_end - agg_start
-        train_time = max(
-            (v["total_sec"] for v in client_logs.values()), default=0.0
-        )
-
-        log_round(log_path, server_round=server_round, client_logs=client_logs,
-                  test_acc=acc, test_f1=f1, test_loss=loss,
-                  train_time=train_time, agg_time=agg_time, eval_time=eval_time,
-                  effective_js=effective_js)
-        cum_comm_mb = append_rounds_row(
-            rounds_csv, server_round=server_round, wall_clock_sec=wall_clock,
-            acc=acc, f1=f1, delta_acc=delta_acc,
-            loss=loss, client_logs=client_logs, model_bytes=model_bytes,
-            train_time_sec=train_time, agg_time_sec=agg_time, eval_time_sec=eval_time,
-            cum_comm_mb=cum_comm_mb, effective_js=effective_js,
-        )
-        append_client_rows(clients_csv, server_round=server_round, client_logs=client_logs)
-        append_classes_rows(
-            classes_csv, server_round=server_round,
-            per_class=per_class, class_names=manifest["class_names"],
-        )
-        all_round_accs.append((server_round, acc))
-        all_round_f1s.append((server_round, f1))
-
-        if server_round == num_rounds:
-            write_summary(
-                summary_path, exp_name=exp_name, all_round_accs=all_round_accs,
-                all_round_f1s=all_round_f1s, total_wall_time=time.time() - run_start,
-                cum_comm_mb=cum_comm_mb, config=config,
-            )
-
-        return MetricRecord({"test_loss": float(loss), "test_acc": float(acc), "test_f1": float(f1)})
-
-    # ── Собираем статичный train_config ───────────────────────────────────────
-    server_flat: dict = {}
-    if server_schedule:
-        for pid, counts in server_schedule.items():
-            for k, cnt in enumerate(counts):
-                server_flat[f"c{pid}_srv_{k}"] = float(cnt)
-
-    # ── Запуск FL ─────────────────────────────────────────────────────────────
+    # FL loop
     result = strategy.start(
         grid=grid,
         initial_arrays=initial_arrays,
         num_rounds=num_rounds,
-        train_config=ConfigRecord({"learning-rate": hp.lr, **adaptive_flat, **server_flat}),
-        evaluate_fn=global_evaluate,
+        train_config=ConfigRecord({"local-epochs": local_epochs}),
+        evaluate_fn=eval_fn,
     )
 
-    torch.save(result.arrays.to_torch_state_dict(), str(model_path))
+    # ── Артефакты ─────────────────────────────────────────────────────────────
+    diagnostics = {d["round"]: d for d in getattr(strategy, "diagnostics", [])}
+    rows = []
+    for r in range(1, num_rounds + 1):
+        tm = result.train_metrics_clientapp.get(r, {})
+        em = result.evaluate_metrics_serverapp.get(r, {})
+        dg = diagnostics.get(r, {})
+        rows.append({
+            "round": r,
+            "test_loss": float(em.get("test-loss", 0)),
+            "test_acc":  float(em.get("test-acc", 0)),
+            "test_f1":   float(em.get("test-f1", 0)),
+            "train_loss_first_mean": float(tm.get("train-loss-first", 0)),
+            "train_loss_last_mean":  float(tm.get("train-loss-last", 0)),
+            "t_compute_mean":        float(tm.get("t-compute", 0)),
+            "drift_mean":            float(tm.get("w-drift", 0)),
+            "update_norm_rel_mean":  float(tm.get("update-norm-rel", 0)),
+            "grad_norm_last_mean":   float(tm.get("grad-norm-last", 0)),
+            "delta_norm":            float(dg.get("delta_norm", 0)),
+            "momentum_norm":         float(dg.get("momentum_norm", 0)),
+            "c_server_norm":         float(dg.get("c_server_norm", 0)),
+            "comm_mb": comm_mb,
+        })
+    pd.DataFrame(rows).to_csv(exp_dir / "rounds.csv", index=False)
+    pd.DataFrame(per_client_rows).to_csv(exp_dir / "clients.csv", index=False)
 
-    # ── Таблица результатов в терминале ───────────────────────────────────────
-    total_wall_time = time.time() - run_start
-    print_summary_table(
-        rounds_csv, exp_name=exp_name,
-        total_wall_time=total_wall_time, cum_comm_mb=cum_comm_mb,
-    )
+    # Финальная модель
+    final = build_model(model_name)
+    final.load_state_dict(result.arrays.to_torch_state_dict(), strict=True)
+    torch.save(final.state_dict(), exp_dir / "model_final.pt")
 
-    # ── Графики ───────────────────────────────────────────────────────────────
-    plots = generate_plots(
-        rounds_csv, clients_csv, classes_csv,
-        plots_dir=plots_dir,
-        class_names=manifest["class_names"],
-        exp_name=exp_name,
-    )
+    exp_tag = f"{dataset}/{model_name}/{agg_name}"
 
-    # ── Запись в index.csv ────────────────────────────────────────────────────
-    best_round, best_acc = max(all_round_accs, key=lambda x: x[1])
-    best_f1 = max(all_round_f1s, key=lambda x: x[1])[1] if all_round_f1s else 0.0
-    append_index_row(
-        experiments_dir,
-        exp_name=exp_name,
-        config=config,
-        best_acc=best_acc,
-        best_f1=best_f1,
-        best_round=best_round,
-        num_rounds=num_rounds,
-        total_time=total_wall_time,
-    )
+    # Best model + per-class heatmap
+    if best["arrays"] is not None:
+        bm = build_model(model_name)
+        bm.load_state_dict(best["arrays"].to_torch_state_dict(), strict=True)
+        torch.save(bm.state_dict(), exp_dir / "model_best.pt")
+        br = evaluate(bm, test_loader, device)
+        pc = br["per_class"]
+        pd.DataFrame({"class_id": range(len(pc)),
+                      "class_name": CIFAR100_FINE_NAMES[:len(pc)] if len(pc) == 100 else list(range(len(pc))),
+                      "accuracy": pc}).to_csv(exp_dir / "class_accuracy.csv", index=False)
+        if len(pc) == 100:
+            _cifar100_superclass_heatmap(
+                pc, exp_dir / "class_accuracy.png",
+                f"Per-class accuracy — best (r{best['round']}, acc={br['acc']:.4f}) — {exp_tag}",
+            )
 
-    # ── Итоговый вывод ────────────────────────────────────────────────────────
-    print(f"Эксперимент : {exp_name}")
-    print(f"Папка       : {exp_dir.resolve()}")
-    print(f"Артефакты   :")
-    print(f"  config.json")
-    print(f"  model.pt")
-    print(f"  train.log")
-    print(f"  summary.json")
-    print(f"  metrics/rounds.csv")
-    print(f"  metrics/clients.csv")
-    print(f"  metrics/classes.csv")
-    if enable_profiling:
-        print(f"  cluster_profile.json")
-    for p in sorted(plots, key=lambda x: x.name):
-        print(f"  plots/{p.name}")
+    # Графики
+    df = pd.DataFrame(rows)
+    _line_plot(df, "test_acc", "Test Accuracy", "steelblue",
+               f"Server Accuracy & Loss — {exp_tag}", exp_dir / "accuracy.png")
+    _line_plot(df, "test_f1", "Macro F1", "seagreen",
+               f"Server F1 & Loss — {exp_tag}", exp_dir / "f1.png")
+
+    df_cli = pd.DataFrame(per_client_rows)
+    if not df_cli.empty:
+        _boxplot_train_loss(df_cli, exp_dir / "train_loss_boxplot.png",
+                            f"Client Train Loss per Round — {exp_tag}")
+
+    print(f"[server] Done. Artifacts: {exp_dir}")

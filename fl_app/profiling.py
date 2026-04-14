@@ -250,11 +250,10 @@ def run_benchmark(
     epoch_times: list[float] = []
     batch_times: list[float] = []
     samples_per_epoch = 0
-    final_loss = 0.0
 
     for _ in range(epochs):
         t0 = time.perf_counter()
-        epoch_loss, batches, epoch_samples = 0.0, 0, 0
+        epoch_samples = 0
         for batch in loader:
             tb = time.perf_counter()
             x = batch[img_col].to(device)
@@ -264,11 +263,8 @@ def run_benchmark(
             loss.backward()
             optimizer.step()
             batch_times.append(time.perf_counter() - tb)
-            epoch_loss += float(loss.item())
-            batches += 1
             epoch_samples += len(y)
         epoch_times.append(time.perf_counter() - t0)
-        final_loss = epoch_loss / max(batches, 1)
         samples_per_epoch = epoch_samples
 
     mean_epoch_sec = sum(epoch_times) / len(epoch_times) if epoch_times else 0.0
@@ -277,21 +273,12 @@ def run_benchmark(
     if batch_times:
         mean_batch_sec = sum(batch_times) / len(batch_times)
         var_batch = sum((t - mean_batch_sec) ** 2 for t in batch_times) / len(batch_times)
-        std_batch_ms = math.sqrt(var_batch) * 1000.0
-        mean_batch_ms = mean_batch_sec * 1000.0
-        cv_batch = std_batch_ms / mean_batch_ms if mean_batch_ms > 0 else 0.0
+        cv_batch = (math.sqrt(var_batch) / mean_batch_sec) if mean_batch_sec > 0 else 0.0
     else:
-        mean_batch_ms = std_batch_ms = cv_batch = 0.0
+        cv_batch = 0.0
 
     return {
-        "bench_samples":         float(samples_per_epoch),
-        "bench_epochs":          float(epochs),
-        "bench_mean_epoch_sec":  round(mean_epoch_sec, 3),
         "bench_samples_per_sec": round(sps, 1),
-        "bench_time_per_1k_sec": round(1000.0 / sps, 3) if sps > 0 else 0.0,
-        "bench_final_loss":      round(final_loss, 4),
-        "bench_mean_batch_ms":   round(mean_batch_ms, 3),
-        "bench_std_batch_ms":    round(std_batch_ms, 3),
         "bench_cv_batch":        round(cv_batch, 4),
         "bench_n_batches":       float(len(batch_times)),
     }
@@ -441,7 +428,7 @@ def print_profiling_summary(
     print("=" * width)
     header = (
         f"  {'ID':>3}  {'CPU':>4}  {'RAM':>6}  {'Сэмплы':>8}"
-        f"  {'Неравн.':>8}  {'Вырожд.':>8}  {'Скорость':>10}  {'Loss':>7}"
+        f"  {'Скорость':>10}  {'CV':>6}"
     )
     if num_classes > 1:
         header += f"  {'Энтропия':>9}"
@@ -454,16 +441,12 @@ def print_profiling_summary(
         cpu = int(m.get("hw_cpu_logical", 0))
         ram = m.get("hw_ram_total_gb", 0.0)
         n   = int(m.get("data_num_samples", 0))
-        imb = m.get("data_imbalance_ratio", 0.0)
-        deg = int(m.get("data_n_degenerate", 0))
         sps = m.get("bench_samples_per_sec", 0.0)
-        loss = m.get("bench_final_loss", 0.0)
+        cv  = m.get("bench_cv_batch", 0.0)
 
-        deg_str = f"{deg} (!)" if deg > 0 else "0"
         line = (
             f"  {cid:>3}  {cpu:>4}  {ram:>5.1f}G"
-            f"  {n:>8}  {imb:>7.1f}x  {deg_str:>8}"
-            f"  {sps:>8.0f}/s  {loss:>7.4f}"
+            f"  {n:>8}  {sps:>8.0f}/s  {cv:>5.2%}"
         )
 
         if num_classes > 1:

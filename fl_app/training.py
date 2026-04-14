@@ -1,316 +1,150 @@
+"""Локальное обучение + серверная evaluate (чистый PyTorch, без I/O)."""
+
 from __future__ import annotations
 
-import random
-from math import floor
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+import time
 
 import torch
-import torch.nn as nn
-from datasets import load_from_disk
+from sklearn.metrics import f1_score
+from torch import nn
 from torch.utils.data import DataLoader
 
 
 def get_device() -> torch.device:
-    return torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def stratified_select(ds, budget: int, label_col: str, seed: int):
-    """Выбрать `budget` сэмплов из ds с сохранением распределения классов.
-
-    Каждый класс получает floor/ceil(budget * class_fraction) сэмплов,
-    выбранных с детерминированным перемешиванием (меняется по раундам).
-    Это предотвращает деградацию редких классов при чанкинге.
-    """
-    labels = ds[label_col]
-    n_total = len(labels)
-    budget = min(budget, n_total)
-
-    # Группируем индексы по классам
-    class_indices: Dict[int, List[int]] = {}
-    for i, lbl in enumerate(labels):
-        if lbl not in class_indices:
-            class_indices[lbl] = []
-        class_indices[lbl].append(i)
-
-    # Пропорциональная квота на каждый класс (floor + распределение остатка)
-    quotas_f = {cls: budget * len(idxs) / n_total for cls, idxs in class_indices.items()}
-    quotas   = {cls: floor(q) for cls, q in quotas_f.items()}
-    remainder = budget - sum(quotas.values())
-    # Остаток отдаём классам с наибольшей дробной частью
-    for cls in sorted(class_indices, key=lambda c: -(quotas_f[c] - quotas[c]))[:remainder]:
-        quotas[cls] += 1
-
-    # Перемешиваем каждый класс и берём квоту
-    rng = random.Random(seed)
-    selected: List[int] = []
-    for cls, idxs in class_indices.items():
-        rng.shuffle(idxs)
-        selected.extend(idxs[:quotas[cls]])
-
-    # Финальное перемешивание чтобы классы не шли блоками
-    rng.shuffle(selected)
-    return ds.select(selected)
-
-
-def _infer_columns(ds) -> Tuple[str, str]:
-    """Определить имена колонок изображения и метки в HuggingFace Dataset."""
-    keys = set(ds.features.keys())
-    img_col = next((c for c in ("img", "image", "pixel_values") if c in keys), None)
-    if img_col is None:
-        raise KeyError(f"Колонка с изображением не найдена. Доступные: {sorted(keys)}")
-    label_col = next(
-        (c for c in ("label", "labels", "fine_label", "coarse_label") if c in keys),
-        None,
-    )
-    if label_col is None:
-        raise KeyError(f"Колонка с меткой не найдена. Доступные: {sorted(keys)}")
-    return img_col, label_col
-
-
-class _TensorDataset(torch.utils.data.Dataset):
-    """Предобработанный датасет: PIL→Tensor один раз, потом из памяти."""
-
-    def __init__(self, images: torch.Tensor, labels: torch.Tensor, augment: bool = False,
-                 image_size: int = 32):
-        self.images = images    # (N, C, H, W) float32
-        self.labels = labels    # (N,) long
-        self.augment = augment
-        if augment:
-            from torchvision.transforms import RandomCrop, RandomHorizontalFlip
-            pad = 4 if image_size <= 32 else 0
-            self.crop = RandomCrop(image_size, padding=pad) if pad > 0 else None
-            self.flip = RandomHorizontalFlip()
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        img = self.images[idx]
-        if self.augment:
-            if self.crop is not None:
-                img = self.crop(img)
-            img = self.flip(img)
-        return img, self.labels[idx]
-
-
-# Размер входа по модели (всё что > 32 — resize + ImageNet normalize)
-_MODEL_IMAGE_SIZE: Dict[str, int] = {
-    "efficientnet_b0": 224,
-}
-
-
-def make_dataloader(
-    partition_path: Path | str,
-    batch_size: int,
-    *,
-    shuffle: bool,
-    num_workers: int = 0,
-    augment: bool = False,
-    dataset=None,
-    model_name: str = "",
-) -> Tuple[DataLoader, str, str]:
-    """Загрузить партицию с диска и вернуть DataLoader + имена колонок.
-
-    Конвертирует PIL→Tensor один раз при загрузке (кеш в памяти).
-    Аугментация применяется на лету к тензорам.
-
-    dataset: опционально передать уже загруженный HF Dataset.
-             Если задан, partition_path игнорируется.
-    model_name: имя модели — определяет размер входа и нормализацию.
-    """
-    from torchvision.transforms.functional import to_tensor, resize, normalize
-
-    ds = dataset if dataset is not None else load_from_disk(str(partition_path))
-    img_col, label_col = _infer_columns(ds)
-
-    image_size = _MODEL_IMAGE_SIZE.get(model_name, 0)
-
-    # Конвертируем все PIL→Tensor один раз
-    if image_size > 32:
-        # Большие изображения: resize + ImageNet normalize
-        imgs = []
-        for x in ds[img_col]:
-            t = to_tensor(x)
-            t = resize(t, [image_size, image_size], antialias=True)
-            t = normalize(t, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-            imgs.append(t)
-        images = torch.stack(imgs)
-    else:
-        # CIFAR-style: just to_tensor
-        image_size = 32
-        images = torch.stack([to_tensor(x) for x in ds[img_col]])
-
-    labels = torch.tensor(ds[label_col], dtype=torch.long)
-
-    tensor_ds = _TensorDataset(images, labels, augment=augment, image_size=image_size)
-    loader = DataLoader(
-        tensor_ds,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
-    return loader, img_col, label_col
+def _flat_norm(tensors) -> float:
+    sq = 0.0
+    for t in tensors:
+        sq += float(t.detach().pow(2).sum().cpu())
+    return sq ** 0.5
 
 
 def local_train(
     model: nn.Module,
     loader: DataLoader,
     *,
-    device: torch.device,
-    epochs: int,
     lr: float,
     momentum: float,
     weight_decay: float,
-    img_col: str,
-    label_col: str,
-    mu: float = 0.0,
-    c_i: Optional[Dict[str, torch.Tensor]] = None,
-    c_server: Optional[Dict[str, torch.Tensor]] = None,
-    global_epoch_offset: int = 0,
-    total_global_epochs: int = 0,
-) -> Tuple[List[float], int, int]:
-    """Локальное обучение клиента.
+    epochs: int,
+    device: torch.device,
+    proximal_mu: float = 0.0,                           # > 0 → FedProx
+    c_server: dict[str, torch.Tensor] | None = None,    # SCAFFOLD
+    c_client: dict[str, torch.Tensor] | None = None,    # SCAFFOLD
+) -> dict:
+    """Один раунд локального обучения.
 
-    Args:
-        mu:       FedProx proximal term (0.0 = выключен).
-        c_i:      SCAFFOLD client control variate {param_name: tensor}.
-        c_server: SCAFFOLD server control variate {param_name: tensor}.
-        global_epoch_offset: номер первой эпохи этого раунда в глобальном расписании.
-        total_global_epochs: общее число эпох за весь FL (num_rounds * local_epochs).
-                             Если >0, lr снижается по cosine от базового lr до 0.
-
-    Returns:
-        (epoch_losses, num_examples, total_steps)
-        total_steps нужен для вычисления c_i_new в SCAFFOLD.
+    Возвращает: loss_first, loss_last, num_examples, t_compute,
+                w_drift, update_norm_rel, grad_norm_last
+    Плюс при SCAFFOLD: c_new, c_delta
     """
-    import math
+    scaffold = c_server is not None and c_client is not None
+    if scaffold:
+        momentum = 0.0  # Option I требует plain SGD
 
     model.to(device).train()
-    # SCAFFOLD требует чистый SGD без momentum и без lr scheduler:
-    # формула c_i_new = (x - y_i) / (K * lr) выведена для plain SGD с постоянным lr.
-    # Momentum меняет эффективный шаг в (1/(1-β)) ≈ 10 раз → формула ломается → взрыв.
-    scaffold_mode = c_i is not None and c_server is not None
-    if scaffold_mode:
-        optimizer = torch.optim.SGD(
-            model.parameters(), lr=lr, momentum=0.0, weight_decay=weight_decay
-        )
-        scheduler = None
-    else:
-        optimizer = torch.optim.SGD(
-            model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay
-        )
-        # Сквозной cosine decay через все раунды и эпохи
-        if total_global_epochs > 0:
-            scheduler = torch.optim.lr_scheduler.LambdaLR(
-                optimizer,
-                lr_lambda=lambda local_ep: 0.5 * (1 + math.cos(
-                    math.pi * (global_epoch_offset + local_ep) / total_global_epochs
-                )),
-            )
-        else:
-            scheduler = None
-    criterion = nn.CrossEntropyLoss()
-    global_params = (
-        [p.data.clone().to(device) for p in model.parameters()] if mu > 0.0 else None
-    )
+    crit = nn.CrossEntropyLoss()
+    opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
 
-    # SCAFFOLD: поправка к градиенту (c_server - c_i), переносим на device заранее
-    scaffold_corr: Optional[Dict[str, torch.Tensor]] = None
-    if scaffold_mode:
-        scaffold_corr = {
-            name: (c_server.get(name, torch.zeros_like(p.data))
-                   - c_i.get(name, torch.zeros_like(p.data))).to(device)
-            for name, p in model.named_parameters()
-            if p.requires_grad
-        }
+    # Стартовые веса — для proximal / SCAFFOLD / диагностики drift
+    init_w = {n: p.detach().clone() for n, p in model.named_parameters()}
+    init_norm = _flat_norm(init_w.values())
 
-    epoch_losses: List[float] = []
-    total_steps = 0
-    for _ in range(epochs):
-        loss_sum, batches = 0.0, 0
+    per_epoch_loss: list[float] = []
+    num_examples = 0
+    grad_norm_last = 0.0
+    t0 = time.perf_counter()
+
+    use_amp = device.type == "cuda"
+    for epoch in range(epochs):
+        loss_sum, n = 0.0, 0
         for x, y in loader:
-            x = x.to(device)
-            y = y.to(device)
-            optimizer.zero_grad(set_to_none=True)
-            loss = criterion(model(x), y)
-            if global_params is not None:
-                prox = sum(
-                    (w - wg).pow(2).sum()
-                    for w, wg in zip(model.parameters(), global_params)
-                )
-                loss = loss + (mu / 2) * prox
+            x, y = x.to(device), y.to(device)
+            opt.zero_grad()
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                loss = crit(model(x), y)
+                if proximal_mu > 0:
+                    prox = sum(((p - init_w[nm]) ** 2).sum()
+                               for nm, p in model.named_parameters())
+                    loss = loss + (proximal_mu / 2) * prox
             loss.backward()
-            # Применяем SCAFFOLD поправку к градиентам
-            if scaffold_corr is not None:
-                for name, p in model.named_parameters():
-                    if p.grad is not None and name in scaffold_corr:
-                        p.grad.add_(scaffold_corr[name])
-            optimizer.step()
-            loss_sum += float(loss.item())
-            batches += 1
-            total_steps += 1
-        epoch_losses.append(loss_sum / max(batches, 1))
-        if scheduler is not None:
-            scheduler.step()
+            if scaffold:
+                for nm, p in model.named_parameters():
+                    if p.grad is None or nm not in c_server:
+                        continue
+                    p.grad.add_(c_server[nm].to(device) - c_client[nm].to(device))
+            # Последняя норма градиента (до шага optimizer)
+            grad_norm_last = _flat_norm(
+                p.grad for p in model.parameters() if p.grad is not None
+            )
+            opt.step()
+            bs = y.size(0)
+            loss_sum += loss.item() * bs
+            n += bs
+        per_epoch_loss.append(loss_sum / max(n, 1))
+        if epoch == 0:
+            num_examples = n
 
-    return epoch_losses, len(loader.dataset), total_steps
+    t_compute = time.perf_counter() - t0
+
+    # Drift / update norm
+    diffs = [p.detach() - init_w[nm].to(p.device) for nm, p in model.named_parameters()]
+    w_drift = _flat_norm(diffs)
+    update_norm_rel = w_drift / max(init_norm, 1e-12)
+
+    result: dict = {
+        "loss_first": per_epoch_loss[0],
+        "loss_last": per_epoch_loss[-1],
+        "num_examples": num_examples,
+        "t_compute": t_compute,
+        "w_drift": w_drift,
+        "update_norm_rel": update_norm_rel,
+        "grad_norm_last": grad_norm_last,
+    }
+
+    if scaffold:
+        K = max(len(loader) * epochs, 1)
+        c_new = {
+            nm: c_client[nm] - c_server[nm]
+                + (init_w[nm].cpu() - p.detach().cpu()) / (K * lr)
+            for nm, p in model.named_parameters()
+            if nm in c_server
+        }
+        result["c_new"] = c_new
+        result["c_delta"] = {nm: c_new[nm] - c_client[nm] for nm in c_new}
+
+    return result
 
 
 @torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    *,
-    device: torch.device,
-    img_col: str,
-    label_col: str,
-) -> Tuple[float, float, Dict[int, Tuple[int, int]], float]:
-    """Серверная оценка модели.
-
-    Returns:
-        (loss, accuracy, per_class, f1_macro)
-        per_class = {class_id: (correct, total)}
-        f1_macro  = macro-averaged F1 score across all classes
-    """
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> dict:
+    """Evaluate: loss, acc, macro-f1."""
     model.to(device).eval()
-    criterion = nn.CrossEntropyLoss()
-    total_loss, batches, correct, total = 0.0, 0, 0, 0
-    per_class: Dict[int, List[int]] = {}   # {class_id: [correct, total]}
-    pred_counts: Dict[int, int] = {}       # {class_id: n_predicted} — needed for precision
-
+    crit = nn.CrossEntropyLoss()
+    loss_sum, correct, total = 0.0, 0, 0
+    ys, ps = [], []
+    use_amp = device.type == "cuda"
     for x, y in loader:
-        x      = x.to(device)
-        y      = y.to(device)
-        logits = model(x)
-
-        total_loss += float(criterion(logits, y).item())
-        batches    += 1
-
-        preds = logits.argmax(dim=1)
-        correct += int((preds == y).sum())
-        total   += y.numel()
-
-        for true_cls, pred_cls in zip(y.tolist(), preds.tolist()):
-            if true_cls not in per_class:
-                per_class[true_cls] = [0, 0]
-            per_class[true_cls][1] += 1
-            if true_cls == pred_cls:
-                per_class[true_cls][0] += 1
-            pred_counts[pred_cls] = pred_counts.get(pred_cls, 0) + 1
-
-    # Macro F1: average per-class F1 over all true classes
-    f1_scores = []
-    for cls, (tp, n_true) in per_class.items():
-        n_pred    = pred_counts.get(cls, 0)
-        precision = tp / n_pred  if n_pred  > 0 else 0.0
-        recall    = tp / n_true  if n_true  > 0 else 0.0
-        denom     = precision + recall
-        f1_scores.append(2 * precision * recall / denom if denom > 0 else 0.0)
-    f1_macro = sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
-
-    per_class_result: Dict[int, Tuple[int, int]] = {
-        cls: (counts[0], counts[1]) for cls, counts in per_class.items()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+            out = model(x)
+            loss = crit(out, y)
+        loss_sum += loss.item() * y.size(0)
+        pred = out.argmax(1)
+        correct += (pred == y).sum().item()
+        total += y.size(0)
+        ys.append(y.cpu()); ps.append(pred.cpu())
+    y_all = torch.cat(ys).numpy(); p_all = torch.cat(ps).numpy()
+    num_classes = int(y_all.max()) + 1
+    per_class = []
+    for c in range(num_classes):
+        mask = y_all == c
+        per_class.append(float((p_all[mask] == c).sum() / max(mask.sum(), 1)))
+    return {
+        "loss": loss_sum / total,
+        "acc": correct / total,
+        "f1_macro": float(f1_score(y_all, p_all, average="macro", zero_division=0)),
+        "per_class": per_class,
     }
-    return total_loss / max(batches, 1), correct / max(total, 1), per_class_result, f1_macro

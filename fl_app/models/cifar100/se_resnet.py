@@ -2,6 +2,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _norm_layer(channels: int, use_group_norm: bool = False) -> nn.Module:
+    """BatchNorm2d или GroupNorm(min(32, channels))."""
+    if use_group_norm:
+        num_groups = min(32, channels)
+        return nn.GroupNorm(num_groups, channels)
+    return nn.BatchNorm2d(channels)
+
+
 class SEBlock(nn.Module):
     """Squeeze-and-Excitation: channel attention за минимум параметров."""
     def __init__(self, channels, reduction=8):
@@ -22,11 +30,11 @@ class SEBlock(nn.Module):
 
 class PreActBlock(nn.Module):
     """Pre-activation BasicBlock + SE (BN→ReLU→Conv порядок)."""
-    def __init__(self, in_ch, out_ch, stride=1):
+    def __init__(self, in_ch, out_ch, stride=1, use_group_norm=False):
         super().__init__()
-        self.bn1   = nn.BatchNorm2d(in_ch)
+        self.bn1   = _norm_layer(in_ch, use_group_norm)
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
-        self.bn2   = nn.BatchNorm2d(out_ch)
+        self.bn2   = _norm_layer(out_ch, use_group_norm)
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
         self.se    = SEBlock(out_ch)
         self.shortcut = (
@@ -56,35 +64,36 @@ class CifarSEResNet(nn.Module):
       n=3  → ~4.5M  (баланс)
       n=4  → ~6.2M  ≈ WRN-28-4 по размеру
 
-    Обучение: SGD + Nesterov, lr=0.1, MultiStepLR([30,60,80], gamma=0.2),
-              Mixup=0.4, label_smooth=0.1, 100 эпох, bs=256.
+    use_group_norm=True: заменяет BatchNorm2d на GroupNorm — устойчивее
+    к non-IID в федеративном обучении (BN statistics расходятся между клиентами).
     """
-    def __init__(self, num_classes: int = 100, n: int = 2, drop_rate: float = 0.3):
+    def __init__(self, num_classes: int = 100, n: int = 2, drop_rate: float = 0.3,
+                 use_group_norm: bool = False):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(3, 64, 3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
+            _norm_layer(64, use_group_norm),
             nn.ReLU(inplace=True),
         )
-        self.stage1 = self._make_stage(64,  64,  n, stride=1)
-        self.stage2 = self._make_stage(64,  128, n, stride=2)
-        self.stage3 = self._make_stage(128, 256, n, stride=2)
-        self.bn_out = nn.BatchNorm2d(256)
+        self.stage1 = self._make_stage(64,  64,  n, stride=1, use_group_norm=use_group_norm)
+        self.stage2 = self._make_stage(64,  128, n, stride=2, use_group_norm=use_group_norm)
+        self.stage3 = self._make_stage(128, 256, n, stride=2, use_group_norm=use_group_norm)
+        self.bn_out = _norm_layer(256, use_group_norm)
         self.drop   = nn.Dropout(drop_rate)
         self.fc     = nn.Linear(256, num_classes)
         self._init_weights()
 
-    def _make_stage(self, in_ch, out_ch, n, stride):
-        layers = [PreActBlock(in_ch, out_ch, stride)]
+    def _make_stage(self, in_ch, out_ch, n, stride, use_group_norm=False):
+        layers = [PreActBlock(in_ch, out_ch, stride, use_group_norm=use_group_norm)]
         for _ in range(1, n):
-            layers.append(PreActBlock(out_ch, out_ch, 1))
+            layers.append(PreActBlock(out_ch, out_ch, 1, use_group_norm=use_group_norm))
         return nn.Sequential(*layers)
 
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(m, nn.BatchNorm2d):
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
