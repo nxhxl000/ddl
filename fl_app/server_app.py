@@ -18,6 +18,8 @@ from flwr.serverapp.strategy.strategy_utils import aggregate_metricrecords
 from fl_app.data import build_loader
 from fl_app.models import build_model, get_hparams
 from fl_app.profiling import (
+    _gini_sizes,
+    _mean_pairwise_js,
     print_profiling_summary,
     run_profiling_round,
     save_cluster_profile,
@@ -199,6 +201,9 @@ def main(grid: Grid, context: Context) -> None:
             replies = list(replies)
             round_counter[0] = server_round
             drifts: list[float] = []
+            class_counts_by_pid: dict[int, dict[int, int]] = {}
+            n_examples_by_pid: dict[int, float] = {}
+            t_compute_by_pid: dict[int, float] = {}
             for reply in replies:
                 if not reply.has_content():
                     continue
@@ -206,15 +211,31 @@ def main(grid: Grid, context: Context) -> None:
                 t_compute = float(m.get("t-compute", 0))
                 t_serialize = float(m.get("t-serialize", 0))
                 created_at = float(reply.metadata.created_at)
-                # t_lifecycle = T_up + idle_wait (по NTP, сервер ↔ клиент).
-                # На NTP-кластере YC точность ≈ 10-50 ms.
                 t_lifecycle = t_aggr_start - created_at
                 drift = float(m.get("w-drift", 0))
                 drifts.append(drift)
+                pid = int(m.get("partition-id", -1))
+                num_ex = float(m.get("num-examples", 0))
+                t_compute_by_pid[pid] = t_compute
+                n_examples_by_pid[pid] = num_ex
+                # Round 1: вытащить data_cls_{N} → распределение классов клиента pid.
+                # Удалить data_cls_* и data_* ключи из metrics, чтобы не сломать
+                # weighted-aggregate в train_metrics_aggr_fn (он ожидает только числа,
+                # а data_cls_* не имеют осмысленного среднего).
+                if server_round == 1:
+                    counts: dict[int, int] = {}
+                    keys_to_drop = [k for k in m.keys() if k.startswith("data_")]
+                    for k in keys_to_drop:
+                        if k.startswith("data_cls_"):
+                            cls_id = int(k.removeprefix("data_cls_"))
+                            counts[cls_id] = int(m[k])
+                        del m[k]
+                    if counts:
+                        class_counts_by_pid[pid] = counts
                 per_client_rows.append({
                     "round":            server_round,
-                    "partition_id":     int(m.get("partition-id", -1)),
-                    "num_examples":     float(m.get("num-examples", 0)),
+                    "partition_id":     pid,
+                    "num_examples":     num_ex,
                     "train_loss_first": float(m.get("train-loss-first", 0)),
                     "train_loss_last":  float(m.get("train-loss-last", 0)),
                     "t_compute":        t_compute,
@@ -228,7 +249,32 @@ def main(grid: Grid, context: Context) -> None:
                     "grad_norm_last":   float(m.get("grad-norm-last", 0)),
                 })
             if drifts:
-                print(f"  [r{server_round}] drift mean={sum(drifts)/len(drifts):.4f}  max={max(drifts):.4f}  min={min(drifts):.4f}")
+                print(f"  [r{server_round}] drift mean={sum(drifts)/len(drifts):.4f}  max={max(drifts):.4f}  min={min(drifts):.4f}", flush=True)
+
+            # ── Метрики гетерогенности ─────────────────────────────────────────
+            # System (каждый раунд): SR, IF, I_s — формулы 26-31
+            if t_compute_by_pid and min(t_compute_by_pid.values()) > 0:
+                times = list(t_compute_by_pid.values())
+                T_max, T_min = max(times), min(times)
+                sr = T_max / T_min
+                idle_frac = sum((T_max - t) / T_max for t in times) / len(times)
+                # I_s: throughput-Gini, s_i = n_i * E / T_i_comp
+                pids_sorted = sorted(t_compute_by_pid.keys())
+                ss = [n_examples_by_pid[p] * local_epochs / t_compute_by_pid[p] for p in pids_sorted]
+                N = len(ss)
+                sum_abs = sum(abs(ss[i] - ss[j]) for i in range(N) for j in range(N))
+                i_s_val = sum_abs / (2 * N * sum(ss)) if sum(ss) > 0 else 0.0
+                print(f"  [r{server_round}] SYS HET: SR={sr:.3f}  IF={idle_frac:.3f}  I_s={i_s_val:.4f}  T_min={T_min:.1f}s  T_max={T_max:.1f}s", flush=True)
+
+            # Data (только round 1): MPJS, Gini — формулы 23, 24
+            if server_round == 1 and class_counts_by_pid:
+                dataset_for_nc = partition.split("__", 1)[0]
+                num_classes_d = {"cifar100": 100, "plantvillage": 38}.get(dataset_for_nc, 10)
+                dists = [class_counts_by_pid[p] for p in sorted(class_counts_by_pid.keys())]
+                mpjs = _mean_pairwise_js(dists, num_classes_d)
+                gini_q = _gini_sizes(dists)
+                print(f"  [r1] DATA HET: MPJS={mpjs:.4f}  Gini_quantity={gini_q:.4f}  num_classes={num_classes_d}", flush=True)
+
             return original(server_round, replies)
 
         strategy.aggregate_train = wrapped

@@ -153,7 +153,7 @@ def train(msg: Message, context: Context) -> Message:
         )
     t_serialize = time.time() - t_serialize_start
 
-    metrics = MetricRecord({
+    metrics_dict: dict[str, float] = {
         "partition-id":     float(pid),
         "num-examples":     float(res["num_examples"]),
         "num-steps":        float(res["num_steps"]),
@@ -164,7 +164,12 @@ def train(msg: Message, context: Context) -> Message:
         "w-drift":          float(res["w_drift"]),
         "update-norm-rel":  float(res["update_norm_rel"]),
         "grad-norm-last":   float(res["grad_norm_last"]),
-    })
+    }
+    # Round 1: класс-распределение для серверного подсчёта MPJS/Gini.
+    # data_cls_{N} = число сэмплов класса N. Сервер фильтрует ключи перед aggregate.
+    if server_round == 1:
+        metrics_dict.update(collect_data_profile(_partition_dir(rc, context.node_config)))
+    metrics = MetricRecord(metrics_dict)
     return Message(
         content=RecordDict({"arrays": reply_arrays, "metrics": metrics}),
         reply_to=msg,
