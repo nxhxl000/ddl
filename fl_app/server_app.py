@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -181,49 +182,20 @@ def main(grid: Grid, context: Context) -> None:
         save_cluster_profile(profiles, exp_dir, partition_name=partition, num_classes=num_classes)
         print_profiling_summary(profiles, num_classes=num_classes)
 
-    # Перехват per-client метрик + таймингов (см. experiments_system_heterogeneity.md)
+    # Перехват per-client метрик + таймингов (см. experiments_system_heterogeneity.md).
+    # T_up per client через delivered_at недоступен: в proto.Metadata нет такого поля,
+    # а Python-Metadata.delivered_at пустой при доставке через GrpcGrid. Используем
+    # NTP-sync absolute timestamps: created_at (клиент) + t_aggr_start (сервер).
     per_client_rows: list[dict] = []
     round_counter = [0]
 
-    # Monkey-patch grid._stub.PullMessages: SuperLink-side delivered_at теряется при
-    # inflate в GrpcGrid.pull_messages. Перехватываем proto-ответ и пишем
-    # delivered_at в кэш, ключ = message_id. См. experiments_system_heterogeneity.md.
-    delivered_at_cache: dict[str, str] = {}
-
-    def _patch_grid_for_delivered_at(g) -> None:
-        if not hasattr(g, "_stub"):
-            return  # InMemoryGrid и пр. — пропускаем
-        stub = g._stub
-        original = stub.PullMessages
-
-        def wrapped_pull(request, *args, **kwargs):
-            response = original(request, *args, **kwargs)
-            for msg_proto in response.messages_list:
-                mid = msg_proto.metadata.message_id
-                da = msg_proto.metadata.delivered_at
-                if mid and da:
-                    delivered_at_cache[mid] = da
-            return response
-
-        stub.PullMessages = wrapped_pull
-
-    _patch_grid_for_delivered_at(grid)
-
-    def _parse_delivered_at(raw: str) -> float:
-        # SuperLink заполняет delivered_at = now().isoformat() (UTC); пустое → не доставлено
-        if not raw:
-            return float("nan")
-        try:
-            return datetime.fromisoformat(raw).timestamp()
-        except ValueError:
-            return float("nan")
-
     def with_per_client_timing_capture(strategy):
-        """Wrap aggregate_train: считывает metadata.created_at / delivered_at,
-        пишет per-client строки с t_compute, t_serialize, t_up, t_local."""
+        """Wrap aggregate_train: считывает metadata.created_at + меряет server-side
+        t_aggr_start. Логирует t_compute, t_serialize, t_local, t_lifecycle (на NTP)."""
         original = strategy.aggregate_train
 
         def wrapped(server_round, replies):
+            t_aggr_start = time.time()
             replies = list(replies)
             round_counter[0] = server_round
             drifts: list[float] = []
@@ -234,11 +206,9 @@ def main(grid: Grid, context: Context) -> None:
                 t_compute = float(m.get("t-compute", 0))
                 t_serialize = float(m.get("t-serialize", 0))
                 created_at = float(reply.metadata.created_at)
-                # delivered_at из proto-ответа SuperLink (через monkey-patch _stub.PullMessages)
-                msg_id = reply.metadata.message_id
-                delivered_at_raw = delivered_at_cache.get(msg_id, "") or reply.metadata.delivered_at
-                delivered_at = _parse_delivered_at(delivered_at_raw)
-                t_up = delivered_at - created_at if delivered_at == delivered_at else float("nan")
+                # t_lifecycle = T_up + idle_wait (по NTP, сервер ↔ клиент).
+                # На NTP-кластере YC точность ≈ 10-50 ms.
+                t_lifecycle = t_aggr_start - created_at
                 drift = float(m.get("w-drift", 0))
                 drifts.append(drift)
                 per_client_rows.append({
@@ -249,8 +219,10 @@ def main(grid: Grid, context: Context) -> None:
                     "train_loss_last":  float(m.get("train-loss-last", 0)),
                     "t_compute":        t_compute,
                     "t_serialize":      t_serialize,
-                    "t_up":             t_up,
                     "t_local":          t_compute + t_serialize,
+                    "created_at":       created_at,
+                    "t_aggr_start":     t_aggr_start,
+                    "t_lifecycle":      t_lifecycle,
                     "w_drift":          drift,
                     "update_norm_rel":  float(m.get("update-norm-rel", 0)),
                     "grad_norm_last":   float(m.get("grad-norm-last", 0)),
