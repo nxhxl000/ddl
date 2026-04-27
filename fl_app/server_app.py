@@ -251,19 +251,20 @@ def main(grid: Grid, context: Context) -> None:
             w_std = (sum((w - w_mean) ** 2 for w in ws) / len(ws)) ** 0.5 if ws else 0.0
             w_imbal = w_std / w_mean if w_mean > 0 else 0.0
 
-            # System (каждый раунд): SR, IF, I_s — формулы 26-31
+            # System (каждый раунд): SR, IF, I_s — формулы 26-31.
+            # Считаем по АКТИВНЫМ клиентам (t_compute > 0); excluded в drop-mode с t=0 пропускаем.
             sr = idle_frac = i_s_val = T_min = T_max = 0.0
-            if t_compute_by_pid and min(t_compute_by_pid.values()) > 0:
-                times = list(t_compute_by_pid.values())
+            active_pids = [p for p, t in t_compute_by_pid.items() if t > 0]
+            if active_pids:
+                times = [t_compute_by_pid[p] for p in active_pids]
                 T_max, T_min = max(times), min(times)
-                sr = T_max / T_min
-                idle_frac = sum((T_max - t) / T_max for t in times) / len(times)
-                pids_sorted = sorted(t_compute_by_pid.keys())
-                ss = [n_examples_by_pid[p] * local_epochs / t_compute_by_pid[p] for p in pids_sorted]
+                sr = T_max / T_min if T_min > 0 else 0.0
+                idle_frac = sum((T_max - t) / T_max for t in times) / len(times) if T_max > 0 else 0.0
+                ss = [n_examples_by_pid[p] * local_epochs / t_compute_by_pid[p] for p in active_pids]
                 N = len(ss)
                 sum_abs = sum(abs(ss[i] - ss[j]) for i in range(N) for j in range(N))
                 i_s_val = sum_abs / (2 * N * sum(ss)) if sum(ss) > 0 else 0.0
-                print(f"  [r{server_round}] SYS HET: SR={sr:.3f}  IF={idle_frac:.3f}  I_s={i_s_val:.4f}  T_min={T_min:.1f}s  T_max={T_max:.1f}s", flush=True)
+                print(f"  [r{server_round}] SYS HET: SR={sr:.3f}  IF={idle_frac:.3f}  I_s={i_s_val:.4f}  T_min={T_min:.1f}s  T_max={T_max:.1f}s  (active={len(active_pids)}/{len(t_compute_by_pid)})", flush=True)
                 print(f"  [r{server_round}] WORK:    W_total={w_total:.0f}  W_imbal={w_imbal:.3f}  n_dropped={n_dropped}", flush=True)
 
             system_het_per_round[server_round] = {
