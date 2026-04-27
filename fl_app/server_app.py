@@ -24,6 +24,7 @@ from fl_app.profiling import (
     run_profiling_round,
     save_cluster_profile,
 )
+from fl_app.scheduler import Schedule, compute_schedule
 from fl_app.strategies import build_strategy, with_cosine_lr_decay
 from fl_app.training import evaluate, get_device
 
@@ -193,6 +194,8 @@ def main(grid: Grid, context: Context) -> None:
     # Хранилища для агрегации в rounds.csv / summary.json
     system_het_per_round: dict[int, dict] = {}
     data_het_overall: dict = {}
+    # Schedule (chunks/epochs per pid), вычисляется после round 1 → используется в round 2+
+    current_schedule: list[Schedule | None] = [None]
 
     def with_per_client_timing_capture(strategy):
         """Wrap aggregate_train: считывает metadata.created_at + меряет server-side
@@ -304,6 +307,32 @@ def main(grid: Grid, context: Context) -> None:
                     "MPJS": mpjs, "Gini_quantity": gini_q, "num_classes": num_classes_d,
                 })
 
+            # Schedule (только round 1): из t_compute_by_pid → chunks/epochs per pid
+            if server_round == 1 and t_compute_by_pid:
+                straggler_mode    = str(rc.get("straggler-mode", "none")).lower()
+                straggler_target  = str(rc.get("straggler-target", "min")).lower()
+                straggler_tol     = float(rc.get("straggler-tolerance", 0.05))
+                straggler_min_chk = float(rc.get("straggler-min-chunk", 0.1))
+                straggler_min_ep  = int(rc.get("straggler-min-epochs", 1))
+                sched = compute_schedule(
+                    t_compute_by_pid,
+                    mode=straggler_mode,
+                    base_epochs=local_epochs,
+                    target=straggler_target,
+                    tolerance=straggler_tol,
+                    min_chunk=straggler_min_chk,
+                    min_epochs=straggler_min_ep,
+                )
+                current_schedule[0] = sched
+                (exp_dir / "schedule.json").write_text(json.dumps(sched.to_dict(), indent=2))
+                if sched.mode != "none":
+                    print(f"  [r1] SCHEDULE ({sched.mode}, target={sched.target}→T_target={sched.T_target:.1f}s, T_upper={sched.T_upper:.1f}s, tol={sched.tolerance:.0%}):", flush=True)
+                    for p in sorted(sched.chunks.keys()):
+                        in_band = "↻ in-band" if t_compute_by_pid[p] <= sched.T_upper else ""
+                        print(f"    pid {p:2d}  t_comp={t_compute_by_pid[p]:6.1f}s  chunk={sched.chunks[p]:.3f}  epochs={sched.epochs[p]}  {in_band}", flush=True)
+                else:
+                    print(f"  [r1] SCHEDULE: mode=none (no straggler mitigation)", flush=True)
+
             result = original(server_round, replies)
 
             # Инкрементальный append: per-client строки этого раунда → clients.csv
@@ -321,6 +350,22 @@ def main(grid: Grid, context: Context) -> None:
         strategy.aggregate_train = wrapped
         return strategy
 
+    def with_dynamic_schedule(strategy):
+        """Инжектит per-client-chunks / per-client-epochs из current_schedule в outbound config.
+        До round 1 (когда schedule ещё None) ничего не добавляет — клиенты используют дефолты.
+        """
+        original = strategy.configure_train
+
+        def wrapped(server_round, arrays, config, grid):
+            sched = current_schedule[0]
+            if sched is not None and sched.mode != "none":
+                config["per-client-chunks"] = sched.chunks_str()
+                config["per-client-epochs"] = sched.epochs_str()
+            return original(server_round, arrays, config, grid)
+
+        strategy.configure_train = wrapped
+        return strategy
+
     # Захват агрегированных train-метрик (для инкрементальной записи в rounds.csv).
     train_metrics_per_round: dict[int, dict] = {}
 
@@ -335,6 +380,7 @@ def main(grid: Grid, context: Context) -> None:
     strategy = build_strategy(agg_name, cfg=rc)
     strategy = with_cosine_lr_decay(strategy, num_rounds)
     strategy = with_per_client_timing_capture(strategy)
+    strategy = with_dynamic_schedule(strategy)
     strategy.train_metrics_aggr_fn = train_aggr
 
     # Callback центральной evaluate + трекинг лучшей модели + инкрементальная запись
@@ -370,6 +416,14 @@ def main(grid: Grid, context: Context) -> None:
             best["acc"] = r["acc"]
             best["round"] = server_round
             best["arrays"] = arrays
+
+        # server_round=0 — initial global eval (до обучения), не пишем в rounds.csv
+        if server_round == 0 or server_round > num_rounds:
+            return MetricRecord({
+                "test-loss": r["loss"],
+                "test-acc":  r["acc"],
+                "test-f1":   r["f1_macro"],
+            })
 
         # ── Инкрементальная запись round-level строки ─────────────────────────
         tm = train_metrics_per_round.get(server_round, {})

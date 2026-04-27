@@ -110,12 +110,20 @@ def train(msg: Message, context: Context) -> Message:
     proximal_mu = float(cfg.get("proximal-mu", 0.0))
     lr = lr * float(cfg.get("lr-scale", 1.0))
 
-    per_client = str(rc.get("per-client-chunks", "")).strip()
+    # per-client-chunks: cfg (per-round, динамический schedule) → rc (статика) → дефолт
+    per_client = str(cfg.get("per-client-chunks", "") or rc.get("per-client-chunks", "")).strip()
     if per_client:
         parts = [float(x) for x in per_client.split(",")]
         chunk_fraction = parts[pid] if pid < len(parts) else 1.0
     else:
         chunk_fraction = float(_hp(rc, model_hp, agg, "chunk-fraction", 1.0))
+
+    # per-client-epochs: аналогично, override локального epochs если задано в cfg/rc
+    per_client_ep = str(cfg.get("per-client-epochs", "") or rc.get("per-client-epochs", "")).strip()
+    if per_client_ep:
+        parts_ep = [int(x) for x in per_client_ep.split(",")]
+        if pid < len(parts_ep):
+            epochs = parts_ep[pid]
     server_round = int(cfg.get("server-round", 0))
     loader = build_loader(
         _partition_dir(rc, context.node_config),
