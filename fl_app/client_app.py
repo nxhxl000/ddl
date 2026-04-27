@@ -56,16 +56,23 @@ def train(msg: Message, context: Context) -> Message:
     cfg_in = msg.content["config"]
     excluded = str(cfg_in.get("excluded-clients", "") or rc.get("excluded-clients", "")).strip()
     if excluded and pid in {int(x) for x in excluded.split(",")}:
+        # Schema MUST идентично с обычным reply, иначе flwr InconsistentMessageReplies
         return Message(
             content=RecordDict({
                 "arrays": msg.content["arrays"],
                 "metrics": MetricRecord({
-                    "partition-id": float(pid),
-                    "num-examples": 0.0, "num-steps": 0.0,
-                    "train-loss-first": 0.0, "train-loss-last": 0.0,
-                    "t-compute": 0.0, "t-serialize": 0.0,
-                    "w-drift": 0.0,
-                    "update-norm-rel": 0.0, "grad-norm-last": 0.0,
+                    "partition-id":     float(pid),
+                    "num-examples":     0.0,
+                    "num-steps":        0.0,
+                    "train-loss-first": 0.0,
+                    "train-loss-last":  0.0,
+                    "t-compute":        0.0,
+                    "t-serialize":      0.0,
+                    "w-drift":          0.0,
+                    "update-norm-rel":  0.0,
+                    "grad-norm-last":   0.0,
+                    "chunk-fraction":   1.0,
+                    "local-epochs":     0.0,
                 }),
             }),
             reply_to=msg,
