@@ -181,34 +181,68 @@ def main(grid: Grid, context: Context) -> None:
         save_cluster_profile(profiles, exp_dir, partition_name=partition, num_classes=num_classes)
         print_profiling_summary(profiles, num_classes=num_classes)
 
-    # Перехват per-client метрик
+    # Перехват per-client метрик + таймингов (см. experiments_system_heterogeneity.md)
     per_client_rows: list[dict] = []
     round_counter = [0]
 
+    def _parse_delivered_at(raw: str) -> float:
+        # SuperLink заполняет delivered_at = now().isoformat() (UTC); пустое → не доставлено
+        if not raw:
+            return float("nan")
+        try:
+            return datetime.fromisoformat(raw).timestamp()
+        except ValueError:
+            return float("nan")
+
+    def with_per_client_timing_capture(strategy):
+        """Wrap aggregate_train: считывает metadata.created_at / delivered_at,
+        пишет per-client строки с t_compute, t_serialize, t_up, t_local."""
+        original = strategy.aggregate_train
+
+        def wrapped(server_round, replies):
+            replies = list(replies)
+            round_counter[0] = server_round
+            drifts: list[float] = []
+            for reply in replies:
+                if not reply.has_content():
+                    continue
+                m = reply.content["metrics"]
+                t_compute = float(m.get("t-compute", 0))
+                t_serialize = float(m.get("t-serialize", 0))
+                created_at = float(reply.metadata.created_at)
+                delivered_at = _parse_delivered_at(reply.metadata.delivered_at)
+                t_up = delivered_at - created_at if delivered_at == delivered_at else float("nan")
+                drift = float(m.get("w-drift", 0))
+                drifts.append(drift)
+                per_client_rows.append({
+                    "round":            server_round,
+                    "partition_id":     int(m.get("partition-id", -1)),
+                    "num_examples":     float(m.get("num-examples", 0)),
+                    "train_loss_first": float(m.get("train-loss-first", 0)),
+                    "train_loss_last":  float(m.get("train-loss-last", 0)),
+                    "t_compute":        t_compute,
+                    "t_serialize":      t_serialize,
+                    "t_up":             t_up,
+                    "t_local":          t_compute + t_serialize,
+                    "w_drift":          drift,
+                    "update_norm_rel":  float(m.get("update-norm-rel", 0)),
+                    "grad_norm_last":   float(m.get("grad-norm-last", 0)),
+                })
+            if drifts:
+                print(f"  [r{server_round}] drift mean={sum(drifts)/len(drifts):.4f}  max={max(drifts):.4f}  min={min(drifts):.4f}")
+            return original(server_round, replies)
+
+        strategy.aggregate_train = wrapped
+        return strategy
+
     def train_aggr(reply_contents, weighted_by_key):
-        round_counter[0] += 1
-        r = round_counter[0]
-        drifts = []
-        for rd in reply_contents:
-            m = rd["metrics"]
-            drift = float(m.get("w-drift", 0))
-            drifts.append(drift)
-            per_client_rows.append({
-                "round": r,
-                "num_examples":     float(m.get("num-examples", 0)),
-                "train_loss_first": float(m.get("train-loss-first", 0)),
-                "train_loss_last":  float(m.get("train-loss-last", 0)),
-                "t_compute":        float(m.get("t-compute", 0)),
-                "w_drift":          drift,
-                "update_norm_rel":  float(m.get("update-norm-rel", 0)),
-                "grad_norm_last":   float(m.get("grad-norm-last", 0)),
-            })
-        if drifts:
-            print(f"  [r{r}] drift mean={sum(drifts)/len(drifts):.4f}  max={max(drifts):.4f}  min={min(drifts):.4f}")
+        # Просто переиспользуем стандартную агрегацию метрик; per-client логирование
+        # делается в обёртке aggregate_train выше.
         return aggregate_metricrecords(reply_contents, weighted_by_key)
 
     strategy = build_strategy(agg_name, cfg=rc)
     strategy = with_cosine_lr_decay(strategy, num_rounds)
+    strategy = with_per_client_timing_capture(strategy)
     strategy.train_metrics_aggr_fn = train_aggr
 
     # Callback центральной evaluate + трекинг лучшей модели

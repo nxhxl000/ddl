@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import torch
@@ -85,9 +86,11 @@ def train(msg: Message, context: Context) -> Message:
             content=RecordDict({
                 "arrays": msg.content["arrays"],
                 "metrics": MetricRecord({
+                    "partition-id": float(pid),
                     "num-examples": 0.0, "num-steps": 0.0,
                     "train-loss-first": 0.0, "train-loss-last": 0.0,
-                    "t-compute": 0.0, "w-drift": 0.0,
+                    "t-compute": 0.0, "t-serialize": 0.0,
+                    "w-drift": 0.0,
                     "update-norm-rel": 0.0, "grad-norm-last": 0.0,
                 }),
             }),
@@ -140,6 +143,7 @@ def train(msg: Message, context: Context) -> Message:
         optimizer=opt_name,
     )
 
+    t_serialize_start = time.time()
     reply_arrays = ArrayRecord(model.state_dict())
     if "c_delta" in res:
         for k, v in res["c_delta"].items():
@@ -147,13 +151,16 @@ def train(msg: Message, context: Context) -> Message:
         context.state["c_client"] = ArrayRecord(
             {k: Array(v.numpy()) for k, v in res["c_new"].items()}
         )
+    t_serialize = time.time() - t_serialize_start
 
     metrics = MetricRecord({
+        "partition-id":     float(pid),
         "num-examples":     float(res["num_examples"]),
         "num-steps":        float(res["num_steps"]),
         "train-loss-first": float(res["loss_first"]),
         "train-loss-last":  float(res["loss_last"]),
         "t-compute":        float(res["t_compute"]),
+        "t-serialize":      float(t_serialize),
         "w-drift":          float(res["w_drift"]),
         "update-norm-rel":  float(res["update_norm_rel"]),
         "grad-norm-last":   float(res["grad_norm_last"]),
