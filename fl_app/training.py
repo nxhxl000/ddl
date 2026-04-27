@@ -31,21 +31,13 @@ def local_train(
     epochs: int,
     device: torch.device,
     proximal_mu: float = 0.0,                           # > 0 → FedProx
-    c_server: dict[str, torch.Tensor] | None = None,    # SCAFFOLD
-    c_client: dict[str, torch.Tensor] | None = None,    # SCAFFOLD
     optimizer: str = "sgd",                             # "sgd" | "adamw"
 ) -> dict:
     """Один раунд локального обучения.
 
-    Возвращает: loss_first, loss_last, num_examples, t_compute,
-                w_drift, update_norm_rel, grad_norm_last
-    Плюс при SCAFFOLD: c_new, c_delta
+    Возвращает: loss_first, loss_last, num_examples, num_steps, t_compute,
+                w_drift, update_norm_rel, grad_norm_last.
     """
-    scaffold = c_server is not None and c_client is not None
-    if scaffold:
-        momentum = 0.0  # Option I требует plain SGD
-        optimizer = "sgd"  # SCAFFOLD несовместим с адаптивными оптимизаторами
-
     model.to(device).train()
     crit = nn.CrossEntropyLoss(label_smoothing=0.1)
     if optimizer == "adamw":
@@ -80,11 +72,6 @@ def local_train(
                                for nm, p in model.named_parameters())
                     loss = loss + (proximal_mu / 2) * prox
             loss.backward()
-            if scaffold:
-                for nm, p in model.named_parameters():
-                    if p.grad is None or nm not in c_server:
-                        continue
-                    p.grad.add_(c_server[nm].to(device) - c_client[nm].to(device))
             # Последняя норма градиента (до шага optimizer)
             grad_norm_last = _flat_norm(
                 p.grad for p in model.parameters() if p.grad is not None
@@ -104,7 +91,7 @@ def local_train(
     w_drift = _flat_norm(diffs)
     update_norm_rel = w_drift / max(init_norm, 1e-12)
 
-    result: dict = {
+    return {
         "loss_first": per_epoch_loss[0],
         "loss_last": per_epoch_loss[-1],
         "num_examples": num_examples,
@@ -114,19 +101,6 @@ def local_train(
         "update_norm_rel": update_norm_rel,
         "grad_norm_last": grad_norm_last,
     }
-
-    if scaffold:
-        K = max(len(loader) * epochs, 1)
-        c_new = {
-            nm: c_client[nm] - c_server[nm]
-                + (init_w[nm].cpu() - p.detach().cpu()) / (K * lr)
-            for nm, p in model.named_parameters()
-            if nm in c_server
-        }
-        result["c_new"] = c_new
-        result["c_delta"] = {nm: c_new[nm] - c_client[nm] for nm in c_new}
-
-    return result
 
 
 @torch.no_grad()

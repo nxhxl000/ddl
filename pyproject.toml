@@ -51,9 +51,6 @@ model          = "wrn_16_4"   # wrn_16_4 | se_resnet | effnet_b0
 aggregation    = "fedavg"     # fedavg | fedavgm | fedprox | scaffold | fednova | fednovam
 
 # FL infrastructure
-enable-profiling    = "false"   # "true" → профилировочный раунд перед FL
-benchmark-samples   = 1000
-benchmark-epochs    = 2
 num-server-rounds   = 80
 fraction-train      = 1.0
 min-train-nodes     = 10
@@ -66,11 +63,13 @@ excluded-clients     = ""         # "2,3,4,5" — pid не обучающих к
 # Round-1 schedule: после baseline-раунда сервер строит per-client chunks/epochs
 # для выравнивания времени раунда внутри tolerance band.
 # none → ничего не делаем (default, sim/cluster без mitigation).
-straggler-mode       = "none"     # none | chunk | epochs
-straggler-target     = "min"      # min | median (или число секунд)
-straggler-tolerance  = 0.05       # ширина полосы [T_target, T_target*(1+tol)]
-straggler-min-chunk  = 0.1        # нижний предел chunk_fraction в chunk-mode
-straggler-min-epochs = 1          # нижний предел local_epochs в epochs-mode
+straggler-mode           = "none" # none | chunk | epochs | drop
+straggler-target         = "min"  # min | median (или число секунд)
+straggler-tolerance      = 0.05   # ширина полосы [T_target, T_target*(1+tol)] для chunk/epochs
+straggler-drop-tolerance = 0.5    # порог для drop: t > T_target*(1+drop_tol)
+straggler-max-dropped    = 3      # максимум исключённых клиентов в drop-mode
+straggler-min-chunk      = 0.1    # нижний предел chunk_fraction в chunk-mode
+straggler-min-epochs     = 1      # нижний предел local_epochs в epochs-mode
 
 # Пути
 data-dir        = "data/"
@@ -98,21 +97,6 @@ fedprox-client-lr = 0.1    # FedProx (дефолт = базовый client-lr; o
 # Docs: https://flower.ai/docs/framework/ref-flower-configuration.html
 #######################################################################
 
-
-#######################################################################
-# CONFIGURATION MIGRATION NOTICE:
-#
-# What was previously called "federation config" for SuperLink
-# connections in pyproject.toml has been renamed and moved.
-#
-# These settings are now **SuperLink connection configuration**
-# and are defined in the Flower configuration file.
-#
-# The entries below are commented out intentionally and are kept
-# only as a migration reference.
-#
-# Docs: https://flower.ai/docs/framework/ref-flower-configuration.html
-#######################################################################
 
 # [tool.flwr.federations]
 # default = "local-sim"

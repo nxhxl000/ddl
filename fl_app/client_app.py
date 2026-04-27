@@ -1,9 +1,7 @@
 """Flower ClientApp — тонкая обёртка вокруг local_train.
 
-Поддерживает FedAvg/FedAvgM/FedProx/SCAFFOLD одной веткой кода:
+Поддерживает FedAvg/FedAvgM/FedProx/FedNovaM одной веткой кода:
 - FedProx активируется, если в config пришло "proximal-mu" > 0.
-- SCAFFOLD активируется, если в payload есть ArrayRecord "c_server".
-  c_i хранится в context.state["c_client"] между раундами.
 
 Клиентские гиперпараметры читаются из run_config (pyproject.toml).
 """
@@ -13,15 +11,12 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-import torch
 from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict
 from flwr.clientapp import ClientApp
-from flwr.common import Array
 
 from fl_app.data import build_loader
 from fl_app.models import build_model, get_hparams
-from fl_app.profiling import collect_data_profile, collect_hardware_info, run_benchmark
-from fl_app.strategies import C_DELTA_PREFIX, C_SERVER_KEY
+from fl_app.profiling import collect_data_profile
 from fl_app.training import get_device, local_train
 
 app = ClientApp()
@@ -30,10 +25,6 @@ app = ClientApp()
 def _partition_dir(rc, node_config) -> Path:
     pid = int(node_config["partition-id"])
     return Path(rc.get("data-dir", "data/")) / "partitions" / rc["partition-name"] / f"client_{pid}"
-
-
-def _ar_to_dict(ar: ArrayRecord) -> dict[str, torch.Tensor]:
-    return {k: torch.from_numpy(a.numpy()).clone() for k, a in ar.items()}
 
 
 def _hp(rc, model_hp: dict, agg: str, key: str, default=None):
@@ -61,26 +52,9 @@ def train(msg: Message, context: Context) -> Message:
     device = get_device()
     model = build_model(model_name)
 
-    cfg_in = msg.content["config"]
-    if float(cfg_in.get("profiling-mode", 0.0)) == 1.0:
-        pid = int(context.node_config["partition-id"])
-        part_dir = _partition_dir(rc, context.node_config)
-        hw = collect_hardware_info()
-        data = collect_data_profile(part_dir)
-        bench = run_benchmark(
-            model, part_dir, device,
-            max_samples=int(cfg_in.get("benchmark-samples", 1000)),
-            epochs=int(cfg_in.get("benchmark-epochs", 2)),
-            batch_size=int(_hp(rc, model_hp, agg, "batch-size")),
-        )
-        metrics = MetricRecord({"partition-id": float(pid), **hw, **data, **bench})
-        return Message(
-            content=RecordDict({"arrays": ArrayRecord(model.state_dict()), "metrics": metrics}),
-            reply_to=msg,
-        )
-
     pid = int(context.node_config["partition-id"])
-    excluded = str(rc.get("excluded-clients", "")).strip()
+    cfg_in = msg.content["config"]
+    excluded = str(cfg_in.get("excluded-clients", "") or rc.get("excluded-clients", "")).strip()
     if excluded and pid in {int(x) for x in excluded.split(",")}:
         return Message(
             content=RecordDict({
@@ -133,32 +107,16 @@ def train(msg: Message, context: Context) -> Message:
         chunk_seed=server_round * 100 + pid,
     )
 
-    c_server = c_client = None
-    if C_SERVER_KEY in msg.content:
-        c_server = _ar_to_dict(msg.content[C_SERVER_KEY])
-        c_client = (
-            _ar_to_dict(context.state["c_client"])
-            if "c_client" in context.state
-            else {n: torch.zeros_like(v) for n, v in c_server.items()}
-        )
-
     res = local_train(
         model, loader,
         lr=lr, momentum=momentum, weight_decay=wd,
         epochs=epochs, device=device,
         proximal_mu=proximal_mu,
-        c_server=c_server, c_client=c_client,
         optimizer=opt_name,
     )
 
     t_serialize_start = time.time()
     reply_arrays = ArrayRecord(model.state_dict())
-    if "c_delta" in res:
-        for k, v in res["c_delta"].items():
-            reply_arrays[C_DELTA_PREFIX + k] = Array(v.numpy())
-        context.state["c_client"] = ArrayRecord(
-            {k: Array(v.numpy()) for k, v in res["c_new"].items()}
-        )
     t_serialize = time.time() - t_serialize_start
 
     metrics_dict: dict[str, float] = {

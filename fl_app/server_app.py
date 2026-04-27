@@ -17,13 +17,7 @@ from flwr.serverapp.strategy.strategy_utils import aggregate_metricrecords
 
 from fl_app.data import build_loader
 from fl_app.models import build_model, get_hparams
-from fl_app.profiling import (
-    _gini_sizes,
-    _mean_pairwise_js,
-    print_profiling_summary,
-    run_profiling_round,
-    save_cluster_profile,
-)
+from fl_app.profiling import _gini_sizes, _mean_pairwise_js
 from fl_app.scheduler import Schedule, compute_schedule
 from fl_app.strategies import build_strategy, with_cosine_lr_decay
 from fl_app.training import evaluate, get_device
@@ -169,22 +163,6 @@ def main(grid: Grid, context: Context) -> None:
     exp_dir.mkdir(parents=True, exist_ok=True)
     (exp_dir / "config.json").write_text(json.dumps(dict(rc), indent=2, default=str))
 
-    # ── Профилировочный раунд (опционально) ───────────────────────────────────
-    if str(rc.get("enable-profiling", "false")).lower() == "true":
-        min_nodes = int(rc.get("min-train-nodes", 1))
-        min_avail = int(rc.get("min-available-nodes", min_nodes))
-        profiles = run_profiling_round(
-            grid, initial_arrays,
-            fraction_train=float(rc.get("fraction-train", 1.0)),
-            min_train_nodes=min_nodes,
-            min_available_nodes=min_avail,
-            benchmark_samples=int(rc.get("benchmark-samples", 1000)),
-            benchmark_epochs=int(rc.get("benchmark-epochs", 2)),
-        )
-        num_classes = {"cifar100": 100, "plantvillage": 38}.get(dataset, 10)
-        save_cluster_profile(profiles, exp_dir, partition_name=partition, num_classes=num_classes)
-        print_profiling_summary(profiles, num_classes=num_classes)
-
     # Перехват per-client метрик + таймингов (см. experiments_system_heterogeneity.md).
     # T_up per client через delivered_at недоступен: в proto.Metadata нет такого поля,
     # а Python-Metadata.delivered_at пустой при доставке через GrpcGrid. Используем
@@ -307,25 +285,35 @@ def main(grid: Grid, context: Context) -> None:
                     "MPJS": mpjs, "Gini_quantity": gini_q, "num_classes": num_classes_d,
                 })
 
-            # Schedule (только round 1): из t_compute_by_pid → chunks/epochs per pid
+            # Schedule (только round 1): из t_compute_by_pid → chunks/epochs/excluded
             if server_round == 1 and t_compute_by_pid:
-                straggler_mode    = str(rc.get("straggler-mode", "none")).lower()
-                straggler_target  = str(rc.get("straggler-target", "min")).lower()
-                straggler_tol     = float(rc.get("straggler-tolerance", 0.05))
-                straggler_min_chk = float(rc.get("straggler-min-chunk", 0.1))
-                straggler_min_ep  = int(rc.get("straggler-min-epochs", 1))
+                straggler_mode     = str(rc.get("straggler-mode", "none")).lower()
+                straggler_target   = str(rc.get("straggler-target", "min")).lower()
+                straggler_tol      = float(rc.get("straggler-tolerance", 0.05))
+                straggler_drop_tol = float(rc.get("straggler-drop-tolerance", 0.5))
+                straggler_max_drop = int(rc.get("straggler-max-dropped", 3))
+                straggler_min_chk  = float(rc.get("straggler-min-chunk", 0.1))
+                straggler_min_ep   = int(rc.get("straggler-min-epochs", 1))
                 sched = compute_schedule(
                     t_compute_by_pid,
                     mode=straggler_mode,
                     base_epochs=local_epochs,
                     target=straggler_target,
                     tolerance=straggler_tol,
+                    drop_tolerance=straggler_drop_tol,
+                    max_dropped=straggler_max_drop,
                     min_chunk=straggler_min_chk,
                     min_epochs=straggler_min_ep,
                 )
                 current_schedule[0] = sched
                 (exp_dir / "schedule.json").write_text(json.dumps(sched.to_dict(), indent=2))
-                if sched.mode != "none":
+                if sched.mode == "drop":
+                    print(f"  [r1] SCHEDULE (drop, target={sched.target}→T_target={sched.T_target:.1f}s, T_drop={sched.T_drop:.1f}s, drop_tol={sched.drop_tolerance:.0%}, max_dropped={straggler_max_drop}):", flush=True)
+                    for p in sorted(t_compute_by_pid.keys()):
+                        marker = "✗ excluded" if p in sched.excluded else "✓ kept"
+                        print(f"    pid {p:2d}  t_comp={t_compute_by_pid[p]:6.1f}s  {marker}", flush=True)
+                    print(f"    → {len(sched.excluded)}/{len(t_compute_by_pid)} dropped: {sched.excluded}", flush=True)
+                elif sched.mode in ("chunk", "epochs"):
                     print(f"  [r1] SCHEDULE ({sched.mode}, target={sched.target}→T_target={sched.T_target:.1f}s, T_upper={sched.T_upper:.1f}s, tol={sched.tolerance:.0%}):", flush=True)
                     for p in sorted(sched.chunks.keys()):
                         in_band = "↻ in-band" if t_compute_by_pid[p] <= sched.T_upper else ""
@@ -351,16 +339,19 @@ def main(grid: Grid, context: Context) -> None:
         return strategy
 
     def with_dynamic_schedule(strategy):
-        """Инжектит per-client-chunks / per-client-epochs из current_schedule в outbound config.
-        До round 1 (когда schedule ещё None) ничего не добавляет — клиенты используют дефолты.
+        """Инжектит per-client-chunks / per-client-epochs / excluded-clients из
+        current_schedule в outbound config. До round 1 ничего не добавляет.
         """
         original = strategy.configure_train
 
         def wrapped(server_round, arrays, config, grid):
             sched = current_schedule[0]
             if sched is not None and sched.mode != "none":
-                config["per-client-chunks"] = sched.chunks_str()
-                config["per-client-epochs"] = sched.epochs_str()
+                if sched.mode == "drop":
+                    config["excluded-clients"] = sched.excluded_str()
+                else:  # chunk/epochs
+                    config["per-client-chunks"] = sched.chunks_str()
+                    config["per-client-epochs"] = sched.epochs_str()
             return original(server_round, arrays, config, grid)
 
         strategy.configure_train = wrapped

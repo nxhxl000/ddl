@@ -1,7 +1,8 @@
-"""Стратегии агрегации: FedAvg, FedAvgM, FedProx, SCAFFOLD.
+"""Стратегии агрегации: FedAvg, FedAvgM (BN-fix), FedProx, FedNovaM.
 
-Три первых — встроены в flwr 1.28, просто реэкспорт с параметрами.
-SCAFFOLD реализован здесь (наследник FedAvg).
+FedAvg/FedAvgM/FedProx — встроены в flwr 1.28 (FedAvgMBn — кастомный наследник
+FedAvgM с исключением BN buffers из server-side моментума).
+FedNovaM — реализован здесь, нормализованная агрегация с server momentum.
 
 Публичный API: build_strategy(name, cfg) -> Strategy
 """
@@ -15,7 +16,7 @@ import logging
 import math
 
 import numpy as np
-from flwr.common import Array, ArrayRecord, ConfigRecord, Message, MetricRecord, RecordDict
+from flwr.common import Array, ArrayRecord, ConfigRecord, Message, MetricRecord
 from flwr.server import Grid
 from flwr.serverapp.strategy import FedAvg, FedAvgM, FedProx
 
@@ -102,92 +103,6 @@ class FedAvgMBn(FedAvgM):
         })
         print(f"  [FedAvgMBn r{server_round}] delta-norm={delta_norm:.4f}  momentum-norm={mom_norm:.4f}", flush=True)
         return agg_arrays, agg_metrics
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SCAFFOLD
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# Сервер хранит:     веса x (ArrayRecord, управляется flwr) + c_server (ArrayRecord)
-# Клиент хранит:     c_i (persistent в context.state)
-# S→C payload:       arrays=x, config[...] + arrays-доп.ключ "c_server"
-# C→S reply:         arrays=y_i, metrics{num-examples,...} + arrays-доп.ключ "c_delta"
-#
-# Ключевой трюк: Flower ждёт ровно 1 ArrayRecord в reply, поэтому c_delta
-# кладётся в тот же ArrayRecord под зарезервированным префиксом, и сервер
-# извлекает/удаляет его до вызова super().aggregate_train().
-
-C_SERVER_KEY = "c_server"          # отдельный ArrayRecord в payload S→C
-C_DELTA_PREFIX = "__c_delta__/"    # префикс для ключей Δc_i внутри reply-ArrayRecord
-
-
-class Scaffold(FedAvg):
-    """SCAFFOLD (Karimireddy et al., 2020) поверх FedAvg."""
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._c_server: ArrayRecord | None = None   # инициализируется в первом раунде
-        self.diagnostics: list[dict] = []
-
-    def configure_train(
-        self, server_round: int, arrays: ArrayRecord, config: ConfigRecord, grid: Grid
-    ) -> Iterable[Message]:
-        # Первый раунд: c_server = нули той же формы, что веса
-        if self._c_server is None:
-            self._c_server = ArrayRecord(
-                {k: Array(np.zeros_like(a.numpy())) for k, a in arrays.items()}
-            )
-
-        # Кладём c_server в payload отдельным ArrayRecord
-        # Переопределяем _construct_messages через временный RecordDict
-        node_ids, _ = _sample(self, grid)
-        config["server-round"] = server_round
-        record = RecordDict({
-            self.arrayrecord_key: arrays,
-            self.configrecord_key: config,
-            C_SERVER_KEY: self._c_server,
-        })
-        return [
-            Message(content=record, message_type="train", dst_node_id=nid)
-            for nid in node_ids
-        ]
-
-    def aggregate_train(
-        self, server_round: int, replies: Iterable[Message]
-    ) -> tuple[ArrayRecord | None, MetricRecord | None]:
-        replies = list(replies)
-
-        # Извлекаем Δc_i из каждого reply и удаляем до валидации flwr
-        deltas: list[dict[str, np.ndarray]] = []
-        for msg in replies:
-            if msg.has_error():
-                continue
-            ar = msg.content[self.arrayrecord_key]
-            d = {}
-            for k in list(ar.keys()):
-                if k.startswith(C_DELTA_PREFIX):
-                    d[k[len(C_DELTA_PREFIX):]] = ar[k].numpy()
-                    del ar[k]
-            deltas.append(d)
-
-        # Обычная агрегация весов + метрик
-        arrays, metrics = super().aggregate_train(server_round, replies)
-
-        # c_server += (1/M) * Σ Δc_i    где M = общее число участников (= min_train_nodes)
-        if deltas and self._c_server is not None:
-            m = float(self.min_train_nodes)
-            keys = list(self._c_server.keys())
-            c_np = {k: self._c_server[k].numpy() for k in keys}
-            for d in deltas:
-                for k in keys:
-                    if k in d:
-                        c_np[k] = c_np[k] + d[k] / m
-            self._c_server = ArrayRecord({k: Array(v) for k, v in c_np.items()})
-
-        c_norm = _nd_norm([a.numpy() for a in self._c_server.values()]) if self._c_server else 0.0
-        self.diagnostics.append({"round": server_round, "c_server_norm": c_norm})
-        print(f"  [SCAFFOLD r{server_round}] c-server-norm={c_norm:.4f}", flush=True)
-        return arrays, metrics
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -348,10 +263,6 @@ def build_strategy(name: str, *, cfg: dict[str, Any]) -> FedAvg:
         )
     if name == "fedprox":
         return FedProx(**common, proximal_mu=float(cfg.get("proximal-mu", 0.01)))
-    if name == "scaffold":
-        return Scaffold(**common)
-    if name == "fednova":
-        return FedNova(**common)
     if name == "fednovam":
         return FedNova(
             **common,
