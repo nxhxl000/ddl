@@ -185,6 +185,30 @@ def main(grid: Grid, context: Context) -> None:
     per_client_rows: list[dict] = []
     round_counter = [0]
 
+    # Monkey-patch grid._stub.PullMessages: SuperLink-side delivered_at теряется при
+    # inflate в GrpcGrid.pull_messages. Перехватываем proto-ответ и пишем
+    # delivered_at в кэш, ключ = message_id. См. experiments_system_heterogeneity.md.
+    delivered_at_cache: dict[str, str] = {}
+
+    def _patch_grid_for_delivered_at(g) -> None:
+        if not hasattr(g, "_stub"):
+            return  # InMemoryGrid и пр. — пропускаем
+        stub = g._stub
+        original = stub.PullMessages
+
+        def wrapped_pull(request, *args, **kwargs):
+            response = original(request, *args, **kwargs)
+            for msg_proto in response.messages_list:
+                mid = msg_proto.metadata.message_id
+                da = msg_proto.metadata.delivered_at
+                if mid and da:
+                    delivered_at_cache[mid] = da
+            return response
+
+        stub.PullMessages = wrapped_pull
+
+    _patch_grid_for_delivered_at(grid)
+
     def _parse_delivered_at(raw: str) -> float:
         # SuperLink заполняет delivered_at = now().isoformat() (UTC); пустое → не доставлено
         if not raw:
@@ -210,7 +234,10 @@ def main(grid: Grid, context: Context) -> None:
                 t_compute = float(m.get("t-compute", 0))
                 t_serialize = float(m.get("t-serialize", 0))
                 created_at = float(reply.metadata.created_at)
-                delivered_at = _parse_delivered_at(reply.metadata.delivered_at)
+                # delivered_at из proto-ответа SuperLink (через monkey-patch _stub.PullMessages)
+                msg_id = reply.metadata.message_id
+                delivered_at_raw = delivered_at_cache.get(msg_id, "") or reply.metadata.delivered_at
+                delivered_at = _parse_delivered_at(delivered_at_raw)
                 t_up = delivered_at - created_at if delivered_at == delivered_at else float("nan")
                 drift = float(m.get("w-drift", 0))
                 drifts.append(drift)
