@@ -7,6 +7,7 @@ import random
 from collections import defaultdict
 from pathlib import Path
 
+import torch
 from datasets import load_from_disk
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
@@ -137,6 +138,6 @@ def build_loader(
         batch_size=batch_size,
         shuffle=train,
         num_workers=0,
-        pin_memory=False,
+        pin_memory=torch.cuda.is_available(),
         drop_last=False,
     )
