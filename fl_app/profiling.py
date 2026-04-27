@@ -84,6 +84,60 @@ def _mean_pairwise_js(dists: List[Dict[int, int]], num_classes: int) -> float:
     return round(sum(values) / len(values), 4)
 
 
+def _gini_sizes(dists: List[Dict[int, int]]) -> float:
+    """Коэффициент Джини для объёмов клиентских датасетов (quantity skew).
+
+    sizes[i] = sum(dists[i]) — общее число сэмплов у клиента i.
+    Возвращает значение в [0, 1]:
+      0 = все клиенты имеют одинаковый объём (IID по объёму);
+      1 = один клиент владеет всеми данными.
+
+    Ортогональна MPJS (label skew) и COE (структурная монополия классов):
+    чистый quantity skew даёт Gini > 0 при MPJS ≈ 0 и COE ≈ 1.
+    """
+    sizes = sorted(sum(d.values()) for d in dists)
+    n = len(sizes)
+    total = sum(sizes)
+    if n < 2 or total == 0:
+        return 0.0
+    cum = sum(i * s for i, s in enumerate(sizes, 1))
+    gini = (2 * cum) / (n * total) - (n + 1) / n
+    return round(gini, 4)
+
+
+def _class_monopoly_index(dists: List[Dict[int, int]], num_classes: int) -> float:
+    """Class Monopoly Index (CMI) — структурная монополия классов среди клиентов.
+
+    Для каждого класса k: share_k[i] = count_i[k] / total_k — доля класса k у клиента i.
+    Метрика = 1 − mean_k H(share_k) / log(N_clients).
+
+    Возвращает значение в [0, 1] (единообразно с MPJS и Gini):
+      0 = каждый класс равномерно представлен у всех клиентов (IID);
+      1 = каждый класс принадлежит ровно одному клиенту (disjoint).
+
+    Дополняет MPJS: разделяет структурную монополию (высокий CMI) и статистический
+    перекос с размазанным владением (низкий CMI при высоком MPJS).
+    Конструктивно — 1 минус дуал `_entropy_norm` по транспонированной матрице client×class.
+    """
+    n_clients = len(dists)
+    if n_clients < 2 or num_classes <= 0:
+        return 0.0
+    log_n = math.log(n_clients)
+    values = []
+    for c in range(num_classes):
+        counts = [d.get(c, 0) for d in dists]
+        total = sum(counts)
+        if total == 0:
+            continue
+        entropy = -sum(
+            (x / total) * math.log(x / total) for x in counts if x > 0
+        )
+        values.append(entropy / log_n)
+    if not values:
+        return 0.0
+    return round(1.0 - sum(values) / len(values), 4)
+
+
 # ── Клиентские утилиты ────────────────────────────────────────────────────────
 
 def _cpu_freq_from_proc() -> float:
@@ -406,7 +460,9 @@ def save_cluster_profile(
         enriched["clients"][str(cid)].get("class_distribution", {})
         for cid in sorted(profiles.keys())
     ]
-    enriched["mean_pairwise_js"] = _mean_pairwise_js(all_dists, num_classes)
+    enriched["mean_pairwise_js"]    = _mean_pairwise_js(all_dists, num_classes)
+    enriched["class_monopoly_index"] = _class_monopoly_index(all_dists, num_classes)
+    enriched["gini_sizes"]           = _gini_sizes(all_dists)
 
     out_path = exp_dir / "cluster_profile.json"
     out_path.write_text(json.dumps(enriched, indent=2))
@@ -465,6 +521,12 @@ def print_profiling_summary(
 
     if num_classes > 1 and len(all_dists) >= 2:
         mpjs = _mean_pairwise_js(all_dists, num_classes)
-        print(f"  Межклиентская гетерогенность (mean pairwise JS): {mpjs:.4f}"
+        cmi  = _class_monopoly_index(all_dists, num_classes)
+        gini = _gini_sizes(all_dists)
+        print(f"  Mean pairwise JS (MPJS, label skew):              {mpjs:.4f}"
               f"  {'(близко к IID)' if mpjs < 0.05 else '(умеренная)' if mpjs < 0.20 else '(высокая)'}")
+        print(f"  Class Monopoly Index (CMI, structural):           {cmi:.4f}"
+              f"  {'(размазано по клиентам)' if cmi < 0.20 else '(умеренная монополия)' if cmi < 0.70 else '(структурная монополия)'}")
+        print(f"  Gini of client sizes (quantity skew):             {gini:.4f}"
+              f"  {'(равные объёмы)' if gini < 0.05 else '(умеренное неравенство)' if gini < 0.25 else '(сильное неравенство)'}")
         print("=" * width)

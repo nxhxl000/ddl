@@ -15,7 +15,7 @@ from flwr.serverapp import Grid, ServerApp
 from flwr.serverapp.strategy.strategy_utils import aggregate_metricrecords
 
 from fl_app.data import build_loader
-from fl_app.models import build_model
+from fl_app.models import build_model, get_hparams
 from fl_app.profiling import (
     print_profiling_summary,
     run_profiling_round,
@@ -139,7 +139,8 @@ def main(grid: Grid, context: Context) -> None:
     model_name = rc["model"]
     agg_name = str(rc["aggregation"]).lower()
     num_rounds = int(rc.get("num-server-rounds", 10))
-    local_epochs = int(rc.get("local-epochs", 3))
+    model_hp = get_hparams(model_name, agg_name)
+    local_epochs = int(rc.get("local-epochs", model_hp["local-epochs"]))
     partition = rc["partition-name"]
     data_dir = rc.get("data-dir", "data/")
     exp_root = rc.get("experiments-dir", "simulation")
@@ -176,7 +177,7 @@ def main(grid: Grid, context: Context) -> None:
             benchmark_samples=int(rc.get("benchmark-samples", 1000)),
             benchmark_epochs=int(rc.get("benchmark-epochs", 2)),
         )
-        num_classes = 100 if "cifar100" in dataset else 10
+        num_classes = {"cifar100": 100, "plantvillage": 38}.get(dataset, 10)
         save_cluster_profile(profiles, exp_dir, partition_name=partition, num_classes=num_classes)
         print_profiling_summary(profiles, num_classes=num_classes)
 

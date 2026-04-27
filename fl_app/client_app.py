@@ -18,7 +18,7 @@ from flwr.clientapp import ClientApp
 from flwr.common import Array
 
 from fl_app.data import build_loader
-from fl_app.models import build_model
+from fl_app.models import build_model, get_hparams
 from fl_app.profiling import collect_data_profile, collect_hardware_info, run_benchmark
 from fl_app.strategies import C_DELTA_PREFIX, C_SERVER_KEY
 from fl_app.training import get_device, local_train
@@ -35,17 +35,30 @@ def _ar_to_dict(ar: ArrayRecord) -> dict[str, torch.Tensor]:
     return {k: torch.from_numpy(a.numpy()).clone() for k, a in ar.items()}
 
 
-def _hp(rc, agg: str, key: str, default):
-    """Per-strategy оверрайд → глобальный → дефолт."""
-    return rc.get(f"{agg}-{key}", rc.get(key, default))
+def _hp(rc, model_hp: dict, agg: str, key: str, default=None):
+    """Резолвинг гиперпараметра:
+      1. run_config per-strategy override: `{agg}-{key}`
+      2. run_config global override: `{key}`
+      3. model defaults (с учётом per-strategy): model_hp[key]
+      4. hardcoded default
+    """
+    if f"{agg}-{key}" in rc:
+        return rc[f"{agg}-{key}"]
+    if key in rc:
+        return rc[key]
+    if key in model_hp:
+        return model_hp[key]
+    return default
 
 
 @app.train()
 def train(msg: Message, context: Context) -> Message:
     rc = context.run_config
     agg = str(rc.get("aggregation", "fedavg")).lower()
+    model_name = rc["model"]
+    model_hp = get_hparams(model_name, agg)
     device = get_device()
-    model = build_model(rc["model"])
+    model = build_model(model_name)
 
     cfg_in = msg.content["config"]
     if float(cfg_in.get("profiling-mode", 0.0)) == 1.0:
@@ -57,7 +70,7 @@ def train(msg: Message, context: Context) -> Message:
             model, part_dir, device,
             max_samples=int(cfg_in.get("benchmark-samples", 1000)),
             epochs=int(cfg_in.get("benchmark-epochs", 2)),
-            batch_size=int(_hp(rc, agg, "batch-size", 64)),
+            batch_size=int(_hp(rc, model_hp, agg, "batch-size")),
         )
         metrics = MetricRecord({"partition-id": float(pid), **hw, **data, **bench})
         return Message(
@@ -65,23 +78,49 @@ def train(msg: Message, context: Context) -> Message:
             reply_to=msg,
         )
 
-    epochs = int(_hp(rc, agg, "local-epochs", 2))
-    lr = float(_hp(rc, agg, "client-lr", 0.03))
-    momentum = float(_hp(rc, agg, "client-momentum", 0.9))
-    wd = float(_hp(rc, agg, "client-weight-decay", 5e-4))
-    bs = int(_hp(rc, agg, "batch-size", 64))
+    pid = int(context.node_config["partition-id"])
+    excluded = str(rc.get("excluded-clients", "")).strip()
+    if excluded and pid in {int(x) for x in excluded.split(",")}:
+        return Message(
+            content=RecordDict({
+                "arrays": msg.content["arrays"],
+                "metrics": MetricRecord({
+                    "num-examples": 0.0, "num-steps": 0.0,
+                    "train-loss-first": 0.0, "train-loss-last": 0.0,
+                    "t-compute": 0.0, "w-drift": 0.0,
+                    "update-norm-rel": 0.0, "grad-norm-last": 0.0,
+                }),
+            }),
+            reply_to=msg,
+        )
+
+    epochs = int(_hp(rc, model_hp, agg, "local-epochs"))
+    lr = float(_hp(rc, model_hp, agg, "client-lr"))
+    momentum = float(_hp(rc, model_hp, agg, "client-momentum"))
+    wd = float(_hp(rc, model_hp, agg, "client-weight-decay"))
+    bs = int(_hp(rc, model_hp, agg, "batch-size"))
+    opt_name = str(_hp(rc, model_hp, agg, "optimizer")).lower()
 
     model.load_state_dict(msg.content["arrays"].to_torch_state_dict(), strict=True)
-
-    loader = build_loader(
-        _partition_dir(rc, context.node_config),
-        batch_size=bs,
-        train=True,
-    )
 
     cfg = msg.content["config"]
     proximal_mu = float(cfg.get("proximal-mu", 0.0))
     lr = lr * float(cfg.get("lr-scale", 1.0))
+
+    per_client = str(rc.get("per-client-chunks", "")).strip()
+    if per_client:
+        parts = [float(x) for x in per_client.split(",")]
+        chunk_fraction = parts[pid] if pid < len(parts) else 1.0
+    else:
+        chunk_fraction = float(_hp(rc, model_hp, agg, "chunk-fraction", 1.0))
+    server_round = int(cfg.get("server-round", 0))
+    loader = build_loader(
+        _partition_dir(rc, context.node_config),
+        batch_size=bs,
+        train=True,
+        chunk_fraction=chunk_fraction,
+        chunk_seed=server_round * 100 + pid,
+    )
 
     c_server = c_client = None
     if C_SERVER_KEY in msg.content:
@@ -98,6 +137,7 @@ def train(msg: Message, context: Context) -> Message:
         epochs=epochs, device=device,
         proximal_mu=proximal_mu,
         c_server=c_server, c_client=c_client,
+        optimizer=opt_name,
     )
 
     reply_arrays = ArrayRecord(model.state_dict())
@@ -110,6 +150,7 @@ def train(msg: Message, context: Context) -> Message:
 
     metrics = MetricRecord({
         "num-examples":     float(res["num_examples"]),
+        "num-steps":        float(res["num_steps"]),
         "train-loss-first": float(res["loss_first"]),
         "train-loss-last":  float(res["loss_last"]),
         "t-compute":        float(res["t_compute"]),

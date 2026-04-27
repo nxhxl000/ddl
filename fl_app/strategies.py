@@ -190,6 +190,109 @@ class Scaffold(FedAvg):
         return arrays, metrics
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FedNova (Wang et al., NeurIPS 2020)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Решает objective inconsistency при разном числе локальных шагов τ_i:
+#   x_{t+1} = x_t - τ_eff * Σ p_i * (x_t - y_i) / τ_i
+#   p_i = n_i / Σ n_j      (вес по объёму данных)
+#   τ_eff = Σ p_i * τ_i    (эффективное число шагов)
+#
+# BN buffers агрегируются как обычное взвешенное среднее (это статистики, не градиенты).
+
+
+class FedNova(FedAvg):
+    """FedNova — нормализованная агрегация для гетерогенных τ_i.
+
+    При server_momentum > 0 применяется серверный моментум поверх
+    нормализованного шага: m_{t+1} = β·m_t + τ_eff·H; x_{t+1} = x_t - m_{t+1}.
+    BN buffers исключаются из моментума (как в FedAvgMBn).
+    """
+
+    def __init__(
+        self,
+        *,
+        server_momentum: float = 0.0,
+        server_learning_rate: float = 1.0,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._x: ArrayRecord | None = None
+        self._momentum: dict[str, np.ndarray] | None = None
+        self._server_momentum = float(server_momentum)
+        self._server_lr = float(server_learning_rate)
+        self.diagnostics: list[dict] = []
+
+    def configure_train(
+        self, server_round: int, arrays: ArrayRecord, config: ConfigRecord, grid: Grid
+    ) -> Iterable[Message]:
+        self._x = arrays
+        return super().configure_train(server_round, arrays, config, grid)
+
+    def aggregate_train(
+        self, server_round: int, replies: Iterable[Message]
+    ) -> tuple[ArrayRecord | None, MetricRecord | None]:
+        replies = list(replies)
+        valid = [m for m in replies if not m.has_error() and m.has_content()]
+
+        if not valid or self._x is None:
+            return super().aggregate_train(server_round, replies)
+
+        ns, taus, ys = [], [], []
+        for msg in valid:
+            metr = msg.content["metrics"]
+            ns.append(float(metr.get("num-examples", 1.0)))
+            taus.append(max(float(metr.get("num-steps", 1.0)), 1.0))
+            ys.append(msg.content["arrays"])
+
+        N = sum(ns)
+        ps = [n / N for n in ns]
+        tau_eff = sum(p * t for p, t in zip(ps, taus))
+
+        x_np = {k: a.numpy() for k, a in self._x.items()}
+        keys = list(x_np.keys())
+        ys_np = [{k: a.numpy() for k, a in y.items()} for y in ys]
+
+        out: dict[str, Array] = {}
+        steps: dict[str, np.ndarray] = {}
+        for k in keys:
+            if _is_bn_buffer(k):
+                avg = sum(p * y[k] for p, y in zip(ps, ys_np))
+                out[k] = Array(np.asarray(avg))
+            else:
+                h = sum(p * (x_np[k] - y[k]) / t for p, t, y in zip(ps, taus, ys_np))
+                steps[k] = tau_eff * h  # "псевдоградиент"
+
+        if self._server_momentum > 0.0:
+            if self._momentum is None:
+                self._momentum = {k: np.zeros_like(v) for k, v in steps.items()}
+            for k, g in steps.items():
+                self._momentum[k] = self._server_momentum * self._momentum[k] + g
+            step_applied = self._momentum
+        else:
+            step_applied = steps
+
+        for k, g in step_applied.items():
+            out[k] = Array(np.asarray(x_np[k] - self._server_lr * g))
+
+        x_new = ArrayRecord(out)
+
+        # Метрики — стандартное взвешенное среднее по num-examples
+        _, agg_metrics = super().aggregate_train(server_round, replies)
+
+        self.diagnostics.append({
+            "round": server_round, "tau_eff": tau_eff,
+            "tau_min": min(taus), "tau_max": max(taus),
+        })
+        print(
+            f"  [FedNova r{server_round}] tau_eff={tau_eff:.1f}  "
+            f"tau_min={min(taus):.0f}  tau_max={max(taus):.0f}",
+            flush=True,
+        )
+        return x_new, agg_metrics
+
+
 # Небольшой helper вместо дублирования sample_nodes
 def _sample(strat: FedAvg, grid: Grid) -> tuple[list[int], list[int]]:
     from flwr.serverapp.strategy.strategy_utils import sample_nodes
@@ -212,6 +315,7 @@ def with_cosine_lr_decay(strategy: FedAvg, num_rounds: int) -> FedAvg:
     def wrapped(server_round, arrays, config, grid):
         t = (server_round - 1) / max(num_rounds, 1)
         config["lr-scale"] = float(0.5 * (1.0 + math.cos(math.pi * t)))
+        config["server-round"] = server_round
         return original(server_round, arrays, config, grid)
 
     strategy.configure_train = wrapped
@@ -246,4 +350,12 @@ def build_strategy(name: str, *, cfg: dict[str, Any]) -> FedAvg:
         return FedProx(**common, proximal_mu=float(cfg.get("proximal-mu", 0.01)))
     if name == "scaffold":
         return Scaffold(**common)
+    if name == "fednova":
+        return FedNova(**common)
+    if name == "fednovam":
+        return FedNova(
+            **common,
+            server_momentum=float(cfg.get("server-momentum", 0.5)),
+            server_learning_rate=float(cfg.get("server-lr", 1.0)),
+        )
     raise ValueError(f"unknown aggregation: {name!r}")

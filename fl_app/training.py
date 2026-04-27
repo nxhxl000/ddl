@@ -33,6 +33,7 @@ def local_train(
     proximal_mu: float = 0.0,                           # > 0 → FedProx
     c_server: dict[str, torch.Tensor] | None = None,    # SCAFFOLD
     c_client: dict[str, torch.Tensor] | None = None,    # SCAFFOLD
+    optimizer: str = "sgd",                             # "sgd" | "adamw"
 ) -> dict:
     """Один раунд локального обучения.
 
@@ -43,10 +44,19 @@ def local_train(
     scaffold = c_server is not None and c_client is not None
     if scaffold:
         momentum = 0.0  # Option I требует plain SGD
+        optimizer = "sgd"  # SCAFFOLD несовместим с адаптивными оптимизаторами
 
     model.to(device).train()
-    crit = nn.CrossEntropyLoss()
-    opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+    crit = nn.CrossEntropyLoss(label_smoothing=0.1)
+    if optimizer == "adamw":
+        opt = torch.optim.AdamW(
+            model.parameters(), lr=lr, weight_decay=weight_decay,
+        )
+    else:
+        opt = torch.optim.SGD(
+            model.parameters(), lr=lr, momentum=momentum,
+            weight_decay=weight_decay, nesterov=(momentum > 0),
+        )
 
     # Стартовые веса — для proximal / SCAFFOLD / диагностики drift
     init_w = {n: p.detach().clone() for n, p in model.named_parameters()}
@@ -98,6 +108,7 @@ def local_train(
         "loss_first": per_epoch_loss[0],
         "loss_last": per_epoch_loss[-1],
         "num_examples": num_examples,
+        "num_steps": len(loader) * epochs,
         "t_compute": t_compute,
         "w_drift": w_drift,
         "update_norm_rel": update_norm_rel,
