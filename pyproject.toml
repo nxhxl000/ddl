@@ -21,6 +21,7 @@ dependencies = [
     "timm>=0.9.0",
     "matplotlib>=3.5.0",
     "pandas>=1.5.0",
+    "scikit-learn>=1.0.0",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -35,14 +36,19 @@ clientapp = "fl_app.client_app:app"
 
 # -----------------------------------------------------
 # Experiment config — только "что запускать"
-# Гиперпараметры модели → fl_app/models/__init__.py
+# Гиперпараметры модели (optimizer, lr, bs, per-strategy) → fl_app/models/__init__.py
 # Параметры стратегии   → fl_app/strategies.py
+#
+# Приоритет: --run-config > pyproject.toml > fl_app/models/HParams
+# Опциональные оверрайды: client-lr, local-epochs, batch-size, optimizer,
+# client-momentum, client-weight-decay, chunk-fraction; per-strategy:
+# {agg}-client-lr, {agg}-local-epochs, ...
 # -----------------------------------------------------
 [tool.flwr.app.config]
 # Что запускать
-partition-name = "cifar100__dirichlet__a0.05__m0__n10__s42"
-model          = "wrn_16_4"   # wrn_16_4 | se_resnet
-aggregation    = "fedavg"     # fedavg | fedavgm | fedprox | scaffold
+partition-name = "cifar100__dirichlet__a0.6__m0__n10__s42"
+model          = "wrn_16_4"   # wrn_16_4 | se_resnet | effnet_b0
+aggregation    = "fedavg"     # fedavg | fedavgm | fedprox | scaffold | fednova | fednovam
 
 # FL infrastructure
 enable-profiling    = "false"   # "true" → профилировочный раунд перед FL
@@ -52,35 +58,45 @@ num-server-rounds   = 80
 fraction-train      = 1.0
 min-train-nodes     = 10
 min-available-nodes = 10
-local-epochs        = 2
 
-# Клиентские гиперпараметры — дефолты (можно переопределить per-strategy ниже)
-client-lr           = 0.03
-client-momentum     = 0.9
-client-weight-decay = 5e-4
-batch-size          = 64
-
-# Per-strategy оверрайды (формат: {agg}-client-lr / {agg}-local-epochs / {agg}-client-momentum)
-fedavg-client-lr      = 0.1
-fedavg-local-epochs   = 3
-
-fedavgm-client-lr     = 0.05
-fedavgm-local-epochs  = 3
-
-fedprox-client-lr     = 0.1
-fedprox-local-epochs  = 3
-
-scaffold-client-lr    = 0.3
-scaffold-local-epochs = 5
+# Straggler-mitigation (FL-уровень)
+per-client-chunks    = ""         # "1.0,1.0,0.7,..." per pid; пустое → chunk-fraction из model HParams
+per-client-epochs    = ""         # "3,3,2,2,..." per pid; пустое → local-epochs из run_config
+excluded-clients     = ""         # "2,3,4,5" — pid не обучающих клиентов
+# Round-1 schedule: после baseline-раунда сервер строит per-client chunks/epochs
+# для выравнивания времени раунда внутри tolerance band.
+# none → ничего не делаем (default, sim/cluster без mitigation).
+straggler-mode       = "none"     # none | chunk | epochs
+straggler-target     = "min"      # min | median (или число секунд)
+straggler-tolerance  = 0.05       # ширина полосы [T_target, T_target*(1+tol)]
+straggler-min-chunk  = 0.1        # нижний предел chunk_fraction в chunk-mode
+straggler-min-epochs = 1          # нижний предел local_epochs в epochs-mode
 
 # Пути
 data-dir        = "data/"
 experiments-dir = "simulation"   # simulation | experiments
 
 # Параметры стратегий (игнорируются неподходящими)
-proximal-mu      = 0.005  # FedProx
-server-momentum  = 0.5    # FedAvgM (τ=2 раунда разгона, steady=2×Δ)
-server-lr        = 1.0    # FedAvgM
+proximal-mu       = 0.0005  # FedProx (tuned на α=0.2: μ=0.0005 даёт +0.57 пп vs FedAvg)
+server-momentum   = 0.5    # FedAvgM / FedNovaM
+server-lr         = 1.0    # FedAvgM / FedNovaM
+fedprox-client-lr = 0.1    # FedProx (дефолт = базовый client-lr; override через --run-config)
+
+
+#######################################################################
+# CONFIGURATION MIGRATION NOTICE:
+#
+# What was previously called "federation config" for SuperLink
+# connections in pyproject.toml has been renamed and moved.
+#
+# These settings are now **SuperLink connection configuration**
+# and are defined in the Flower configuration file.
+#
+# The entries below are commented out intentionally and are kept
+# only as a migration reference.
+#
+# Docs: https://flower.ai/docs/framework/ref-flower-configuration.html
+#######################################################################
 
 
 #######################################################################
@@ -103,5 +119,5 @@ server-lr        = 1.0    # FedAvgM
 
 # [tool.flwr.federations.local-sim]
 # options.num-supernodes = 10
-# options.backend.client-resources.num-cpus = 0.5
-# options.backend.client-resources.num-gpus = 0.1
+# options.backend.client-resources.num-cpus = 2
+# options.backend.client-resources.num-gpus = 0.2
