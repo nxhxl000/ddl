@@ -190,6 +190,9 @@ def main(grid: Grid, context: Context) -> None:
     # NTP-sync absolute timestamps: created_at (клиент) + t_aggr_start (сервер).
     per_client_rows: list[dict] = []
     round_counter = [0]
+    # Хранилища для агрегации в rounds.csv / summary.json
+    system_het_per_round: dict[int, dict] = {}
+    data_het_overall: dict = {}
 
     def with_per_client_timing_capture(strategy):
         """Wrap aggregate_train: считывает metadata.created_at + меряет server-side
@@ -218,6 +221,10 @@ def main(grid: Grid, context: Context) -> None:
                 num_ex = float(m.get("num-examples", 0))
                 t_compute_by_pid[pid] = t_compute
                 n_examples_by_pid[pid] = num_ex
+                chunk_frac = float(m.get("chunk-fraction", 1.0))
+                local_eps = float(m.get("local-epochs", local_epochs))
+                # Объём локальной работы клиента: эффективное число просмотренных сэмплов
+                w_client = num_ex * chunk_frac * local_eps
                 # Round 1: вытащить data_cls_{N} → распределение классов клиента pid.
                 # Удалить data_cls_* и data_* ключи из metrics, чтобы не сломать
                 # weighted-aggregate в train_metrics_aggr_fn (он ожидает только числа,
@@ -236,6 +243,9 @@ def main(grid: Grid, context: Context) -> None:
                     "round":            server_round,
                     "partition_id":     pid,
                     "num_examples":     num_ex,
+                    "chunk_fraction":   chunk_frac,
+                    "local_epochs":     local_eps,
+                    "w_client":         w_client,
                     "train_loss_first": float(m.get("train-loss-first", 0)),
                     "train_loss_last":  float(m.get("train-loss-last", 0)),
                     "t_compute":        t_compute,
@@ -252,19 +262,35 @@ def main(grid: Grid, context: Context) -> None:
                 print(f"  [r{server_round}] drift mean={sum(drifts)/len(drifts):.4f}  max={max(drifts):.4f}  min={min(drifts):.4f}", flush=True)
 
             # ── Метрики гетерогенности ─────────────────────────────────────────
+            # Объём локальной работы (round-level)
+            ws = [r["w_client"] for r in per_client_rows if r["round"] == server_round]
+            n_dropped = sum(1 for w in ws if w == 0)
+            w_total = sum(ws)
+            w_mean = w_total / len(ws) if ws else 0.0
+            w_std = (sum((w - w_mean) ** 2 for w in ws) / len(ws)) ** 0.5 if ws else 0.0
+            w_imbal = w_std / w_mean if w_mean > 0 else 0.0
+
             # System (каждый раунд): SR, IF, I_s — формулы 26-31
+            sr = idle_frac = i_s_val = T_min = T_max = 0.0
             if t_compute_by_pid and min(t_compute_by_pid.values()) > 0:
                 times = list(t_compute_by_pid.values())
                 T_max, T_min = max(times), min(times)
                 sr = T_max / T_min
                 idle_frac = sum((T_max - t) / T_max for t in times) / len(times)
-                # I_s: throughput-Gini, s_i = n_i * E / T_i_comp
                 pids_sorted = sorted(t_compute_by_pid.keys())
                 ss = [n_examples_by_pid[p] * local_epochs / t_compute_by_pid[p] for p in pids_sorted]
                 N = len(ss)
                 sum_abs = sum(abs(ss[i] - ss[j]) for i in range(N) for j in range(N))
                 i_s_val = sum_abs / (2 * N * sum(ss)) if sum(ss) > 0 else 0.0
                 print(f"  [r{server_round}] SYS HET: SR={sr:.3f}  IF={idle_frac:.3f}  I_s={i_s_val:.4f}  T_min={T_min:.1f}s  T_max={T_max:.1f}s", flush=True)
+                print(f"  [r{server_round}] WORK:    W_total={w_total:.0f}  W_imbal={w_imbal:.3f}  n_dropped={n_dropped}", flush=True)
+
+            system_het_per_round[server_round] = {
+                "SR": sr, "IF": idle_frac, "I_s": i_s_val,
+                "T_min": T_min, "T_max": T_max,
+                "W_total": w_total, "W_imbalance": w_imbal,
+                "n_dropped": n_dropped,
+            }
 
             # Data (только round 1): MPJS, Gini — формулы 23, 24
             if server_round == 1 and class_counts_by_pid:
@@ -274,24 +300,68 @@ def main(grid: Grid, context: Context) -> None:
                 mpjs = _mean_pairwise_js(dists, num_classes_d)
                 gini_q = _gini_sizes(dists)
                 print(f"  [r1] DATA HET: MPJS={mpjs:.4f}  Gini_quantity={gini_q:.4f}  num_classes={num_classes_d}", flush=True)
+                data_het_overall.update({
+                    "MPJS": mpjs, "Gini_quantity": gini_q, "num_classes": num_classes_d,
+                })
 
-            return original(server_round, replies)
+            result = original(server_round, replies)
+
+            # Инкрементальный append: per-client строки этого раунда → clients.csv
+            rows_this = [r for r in per_client_rows if r["round"] == server_round]
+            if rows_this:
+                clients_path = exp_dir / "clients.csv"
+                pd.DataFrame(rows_this).to_csv(
+                    clients_path, mode="a",
+                    header=not clients_path.exists(),
+                    index=False,
+                )
+
+            return result
 
         strategy.aggregate_train = wrapped
         return strategy
 
+    # Захват агрегированных train-метрик (для инкрементальной записи в rounds.csv).
+    train_metrics_per_round: dict[int, dict] = {}
+
     def train_aggr(reply_contents, weighted_by_key):
-        # Просто переиспользуем стандартную агрегацию метрик; per-client логирование
-        # делается в обёртке aggregate_train выше.
-        return aggregate_metricrecords(reply_contents, weighted_by_key)
+        agg = aggregate_metricrecords(reply_contents, weighted_by_key)
+        if round_counter[0] > 0:
+            train_metrics_per_round[round_counter[0]] = {
+                k: float(v) for k, v in dict(agg).items() if isinstance(v, (int, float))
+            }
+        return agg
 
     strategy = build_strategy(agg_name, cfg=rc)
     strategy = with_cosine_lr_decay(strategy, num_rounds)
     strategy = with_per_client_timing_capture(strategy)
     strategy.train_metrics_aggr_fn = train_aggr
 
-    # Callback центральной evaluate + трекинг лучшей модели
+    # Callback центральной evaluate + трекинг лучшей модели + инкрементальная запись
     best = {"acc": -1.0, "round": 0, "arrays": None}
+    rows: list[dict] = []  # rounds-level строки, накапливаем для plot'ов в конце
+
+    def _write_summary() -> None:
+        sr_vals = [r["SR"]  for r in rows if r["SR"]  > 0]
+        if_vals = [r["IF"]  for r in rows if r["T_max"] > 0]
+        is_vals = [r["I_s"] for r in rows if r["I_s"] > 0]
+        summary = {
+            "config":            dict(rc),
+            "best_acc":          best["acc"],
+            "best_round":        best["round"],
+            "rounds_completed":  len(rows),
+            "num_rounds":        num_rounds,
+            "data_heterogeneity": data_het_overall,
+            "system_heterogeneity_mean": {
+                "SR":          sum(sr_vals) / len(sr_vals) if sr_vals else 0.0,
+                "IF":          sum(if_vals) / len(if_vals) if if_vals else 0.0,
+                "I_s":         sum(is_vals) / len(is_vals) if is_vals else 0.0,
+                "W_total_sum": sum(r["W_total"] for r in rows),
+            },
+            "excluded_clients":  rc.get("excluded-clients", ""),
+            "per_client_chunks": rc.get("per-client-chunks", ""),
+        }
+        (exp_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
     def eval_fn(server_round: int, arrays: ArrayRecord):
         m = build_model(model_name)
         m.load_state_dict(arrays.to_torch_state_dict(), strict=True)
@@ -300,6 +370,45 @@ def main(grid: Grid, context: Context) -> None:
             best["acc"] = r["acc"]
             best["round"] = server_round
             best["arrays"] = arrays
+
+        # ── Инкрементальная запись round-level строки ─────────────────────────
+        tm = train_metrics_per_round.get(server_round, {})
+        sh = system_het_per_round.get(server_round, {})
+        diag_dict = {d["round"]: d for d in getattr(strategy, "diagnostics", [])}
+        dg = diag_dict.get(server_round, {})
+        row = {
+            "round":                 server_round,
+            "test_loss":             float(r["loss"]),
+            "test_acc":              float(r["acc"]),
+            "test_f1":               float(r["f1_macro"]),
+            "train_loss_first_mean": float(tm.get("train-loss-first", 0)),
+            "train_loss_last_mean":  float(tm.get("train-loss-last", 0)),
+            "t_compute_mean":        float(tm.get("t-compute", 0)),
+            "drift_mean":            float(tm.get("w-drift", 0)),
+            "update_norm_rel_mean":  float(tm.get("update-norm-rel", 0)),
+            "grad_norm_last_mean":   float(tm.get("grad-norm-last", 0)),
+            "delta_norm":            float(dg.get("delta_norm", 0)),
+            "momentum_norm":         float(dg.get("momentum_norm", 0)),
+            "c_server_norm":         float(dg.get("c_server_norm", 0)),
+            "comm_mb":               comm_mb,
+            "SR":                    float(sh.get("SR", 0)),
+            "IF":                    float(sh.get("IF", 0)),
+            "I_s":                   float(sh.get("I_s", 0)),
+            "T_min":                 float(sh.get("T_min", 0)),
+            "T_max":                 float(sh.get("T_max", 0)),
+            "W_total":               float(sh.get("W_total", 0)),
+            "W_imbalance":           float(sh.get("W_imbalance", 0)),
+            "n_dropped":             int(sh.get("n_dropped", 0)),
+        }
+        rows.append(row)
+        rounds_path = exp_dir / "rounds.csv"
+        pd.DataFrame([row]).to_csv(
+            rounds_path, mode="a",
+            header=not rounds_path.exists(),
+            index=False,
+        )
+        _write_summary()
+
         return MetricRecord({
             "test-loss": r["loss"],
             "test-acc":  r["acc"],
@@ -316,30 +425,10 @@ def main(grid: Grid, context: Context) -> None:
     )
 
     # ── Артефакты ─────────────────────────────────────────────────────────────
-    diagnostics = {d["round"]: d for d in getattr(strategy, "diagnostics", [])}
-    rows = []
-    for r in range(1, num_rounds + 1):
-        tm = result.train_metrics_clientapp.get(r, {})
-        em = result.evaluate_metrics_serverapp.get(r, {})
-        dg = diagnostics.get(r, {})
-        rows.append({
-            "round": r,
-            "test_loss": float(em.get("test-loss", 0)),
-            "test_acc":  float(em.get("test-acc", 0)),
-            "test_f1":   float(em.get("test-f1", 0)),
-            "train_loss_first_mean": float(tm.get("train-loss-first", 0)),
-            "train_loss_last_mean":  float(tm.get("train-loss-last", 0)),
-            "t_compute_mean":        float(tm.get("t-compute", 0)),
-            "drift_mean":            float(tm.get("w-drift", 0)),
-            "update_norm_rel_mean":  float(tm.get("update-norm-rel", 0)),
-            "grad_norm_last_mean":   float(tm.get("grad-norm-last", 0)),
-            "delta_norm":            float(dg.get("delta_norm", 0)),
-            "momentum_norm":         float(dg.get("momentum_norm", 0)),
-            "c_server_norm":         float(dg.get("c_server_norm", 0)),
-            "comm_mb": comm_mb,
-        })
-    pd.DataFrame(rows).to_csv(exp_dir / "rounds.csv", index=False)
-    pd.DataFrame(per_client_rows).to_csv(exp_dir / "clients.csv", index=False)
+    # rounds.csv, clients.csv, summary.json уже записаны инкрементально
+    # (eval_fn после каждого раунда + wrapper для clients.csv).
+    # Здесь только финальный summary update + модели + графики.
+    _write_summary()
 
     # Финальная модель
     final = build_model(model_name)

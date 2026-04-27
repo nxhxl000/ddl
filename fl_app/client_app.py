@@ -164,6 +164,8 @@ def train(msg: Message, context: Context) -> Message:
         "w-drift":          float(res["w_drift"]),
         "update-norm-rel":  float(res["update_norm_rel"]),
         "grad-norm-last":   float(res["grad_norm_last"]),
+        "chunk-fraction":   float(chunk_fraction),
+        "local-epochs":     float(epochs),
     }
     # Round 1: класс-распределение для серверного подсчёта MPJS/Gini.
     # data_cls_{N} = число сэмплов класса N. Сервер фильтрует ключи перед aggregate.
